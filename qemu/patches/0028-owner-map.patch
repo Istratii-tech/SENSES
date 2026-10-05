@@ -1,0 +1,314 @@
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7920,6 +7920,236 @@
+     return m;
+ }
+ 
++/*
++ * ★★★ Карта владельцев, назначенных ГОСТЕМ.
++ *
++ * Патч 0016 прощает chown: мы не root, настоящего владельца сменить нельзя, а
++ * отказ смертелен (installd сносит каталог пакета). В его же шапке записано
++ * честное «настоящий владелец не меняется, и там, где система СВЕРЯЕТ
++ * владельца, это будет видно — и лечиться отдельно». Вот это отдельно.
++ *
++ * Видно было так: PackageManagerService сверяет владельца каталога данных с uid
++ * пакета, не сходится — и после загрузки на экране висит
++ *
++ *     System UIDs Inconsistent
++ *     UIDs on the system are inconsistent, you need to wipe your data partition
++ *
++ * Лечение: запоминаем, кому гость НАЗНАЧИЛ файл, и при stat отвечаем этим
++ * владельцем. Тогда /data/data/<пакет> отдаёт uid пакета, а то, чего гость не
++ * трогал (например область свойств), остаётся под прежним правилом
++ * guest_stat_as_root — «свой файл выглядит как root».
++ *
++ * Хранилище — общий файл, потому что chown делает ОДИН процесс (installd), а
++ * сверяет ДРУГОЙ (system_server), и каждый гостевой процесс — свой qemu.
++ * Запись строкой ровно 52 байта, дописывание O_APPEND: короткая дозапись в
++ * обычный файл неделима, а нам большего и не нужно. Читатели дочитывают хвост,
++ * когда файл вырос.
++ *
++ * Путь задаётся переменной GUEST_OWNERS. Нет её — карты нет, поведение прежнее.
++ *
++ * ⚠️ Карта живёт РЯДОМ С /data и стирается вместе с ним: она осмысленна только
++ * пока целы те же inode. Если inode переиспользуется под другой файл, запись
++ * станет ложной — цена невелика, а привязка к пути стоила бы дороже.
++ */
++#define GUEST_OWN_REC 52                 /* "%016llx %016llx %08x %08x\n" */
++
++typedef struct {
++    uint64_t dev;
++    uint64_t ino;
++    uint32_t uid;
++    uint32_t gid;
++    int used;
++} GuestOwnEnt;
++
++static pthread_mutex_t guest_own_lock = PTHREAD_MUTEX_INITIALIZER;
++static GuestOwnEnt *guest_own_tab;
++static size_t guest_own_cap;             /* всегда степень двойки */
++static size_t guest_own_cnt;
++static int guest_own_fd = -1;            /* чтение карты */
++static off_t guest_own_seen;             /* сколько байт уже разобрано */
++static int guest_own_off;                /* 1 — карты нет, больше не пробуем */
++
++static size_t guest_own_slot(size_t cap, uint64_t dev, uint64_t ino)
++{
++    /* Перемешивание попроще: inode и так почти равномерен. */
++    uint64_t h = ino * 1099511628211ULL ^ (dev * 1469598103934665603ULL);
++    return (size_t)(h & (uint64_t)(cap - 1));
++}
++
++static void guest_own_insert(GuestOwnEnt *tab, size_t cap, uint64_t dev,
++                           uint64_t ino, uint32_t uid, uint32_t gid)
++{
++    size_t i = guest_own_slot(cap, dev, ino);
++    for (;;) {
++        if (!tab[i].used) {
++            tab[i].used = 1;
++            tab[i].dev = dev;
++            tab[i].ino = ino;
++            tab[i].uid = uid;
++            tab[i].gid = gid;
++            return;
++        }
++        if (tab[i].dev == dev && tab[i].ino == ino) {
++            tab[i].uid = uid;          /* последняя запись побеждает */
++            tab[i].gid = gid;
++            return;
++        }
++        i = (i + 1) & (cap - 1);
++    }
++}
++
++static void guest_own_put(uint64_t dev, uint64_t ino, uint32_t uid, uint32_t gid)
++{
++    if (guest_own_cap == 0 || (guest_own_cnt + 1) * 2 > guest_own_cap) {
++        size_t ncap = guest_own_cap ? guest_own_cap * 2 : 1024;
++        GuestOwnEnt *ntab = g_new0(GuestOwnEnt, ncap);
++        size_t i;
++        for (i = 0; i < guest_own_cap; i++) {
++            if (guest_own_tab[i].used) {
++                guest_own_insert(ntab, ncap, guest_own_tab[i].dev, guest_own_tab[i].ino,
++                               guest_own_tab[i].uid, guest_own_tab[i].gid);
++            }
++        }
++        g_free(guest_own_tab);
++        guest_own_tab = ntab;
++        guest_own_cap = ncap;
++    }
++    /* Счётчик считает вставки, а не уникальные ключи: он нужен только для
++     * решения «пора расти», и завышение тут безобидно. */
++    guest_own_cnt++;
++    guest_own_insert(guest_own_tab, guest_own_cap, dev, ino, uid, gid);
++}
++
++/* Дочитать хвост карты. Вызывается под замком. */
++static void guest_own_refresh(void)
++{
++    const char *path;
++    struct stat sb;
++    char buf[GUEST_OWN_REC * 64];
++
++    if (guest_own_off) {
++        return;
++    }
++    if (guest_own_fd < 0) {
++        path = getenv("GUEST_OWNERS");
++        if (!path || !*path) {
++            guest_own_off = 1;
++            return;
++        }
++        guest_own_fd = open(path, O_RDONLY | O_CLOEXEC);
++        if (guest_own_fd < 0) {
++            /* Файла ещё нет — появится при первом chown, попробуем позже. */
++            return;
++        }
++    }
++    if (fstat(guest_own_fd, &sb) != 0 || sb.st_size <= guest_own_seen) {
++        return;
++    }
++    while (guest_own_seen < sb.st_size) {
++        ssize_t n = pread(guest_own_fd, buf, sizeof(buf), guest_own_seen);
++        ssize_t at;
++        if (n < GUEST_OWN_REC) {
++            break;
++        }
++        n -= n % GUEST_OWN_REC;
++        for (at = 0; at + GUEST_OWN_REC <= n; at += GUEST_OWN_REC) {
++            unsigned long long dev, ino;
++            unsigned uid, gid;
++            if (sscanf(buf + at, "%16llx %16llx %8x %8x", &dev, &ino, &uid, &gid) == 4) {
++                guest_own_put(dev, ino, uid, gid);
++            }
++        }
++        guest_own_seen += n;
++    }
++}
++
++static int guest_own_get(uint64_t dev, uint64_t ino, uint32_t *uid, uint32_t *gid)
++{
++    int found = 0;
++    size_t i;
++
++    pthread_mutex_lock(&guest_own_lock);
++    guest_own_refresh();
++    if (guest_own_cap) {
++        i = guest_own_slot(guest_own_cap, dev, ino);
++        for (;;) {
++            if (!guest_own_tab[i].used) {
++                break;
++            }
++            if (guest_own_tab[i].dev == dev && guest_own_tab[i].ino == ino) {
++                *uid = guest_own_tab[i].uid;
++                *gid = guest_own_tab[i].gid;
++                found = 1;
++                break;
++            }
++            i = (i + 1) & (guest_own_cap - 1);
++        }
++    }
++    pthread_mutex_unlock(&guest_own_lock);
++    return found;
++}
++
++/*
++ * Запомнить назначение. `st` — реальные dev/ino цели, uid/gid — то, что просил
++ * гость; (uid_t)-1 означает «не менять», и тогда берём то, что видел бы гость.
++ */
++static void guest_own_note(const struct stat *st, uint32_t uid, uint32_t gid)
++{
++    const char *path;
++    char rec[GUEST_OWN_REC + 1];
++    uint32_t cur_u = 0, cur_g = 0;
++    int fd;
++
++    path = getenv("GUEST_OWNERS");
++    if (!path || !*path) {
++        return;
++    }
++    if (uid == (uint32_t)-1 || gid == (uint32_t)-1) {
++        if (!guest_own_get(st->st_dev, st->st_ino, &cur_u, &cur_g)) {
++            cur_u = 0;                 /* прежнее правило: свой файл = root */
++            cur_g = 0;
++        }
++        if (uid == (uint32_t)-1) {
++            uid = cur_u;
++        }
++        if (gid == (uint32_t)-1) {
++            gid = cur_g;
++        }
++    }
++    snprintf(rec, sizeof(rec), "%016llx %016llx %08x %08x\n",
++             (unsigned long long)st->st_dev, (unsigned long long)st->st_ino,
++             uid, gid);
++    fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
++    if (fd >= 0) {
++        ssize_t w = write(fd, rec, GUEST_OWN_REC);
++        (void)w;
++        close(fd);
++    }
++    pthread_mutex_lock(&guest_own_lock);
++    guest_own_put(st->st_dev, st->st_ino, uid, gid);
++    pthread_mutex_unlock(&guest_own_lock);
++}
++
++static void guest_own_note_path(const char *hostpath, int nofollow,
++                              uint32_t uid, uint32_t gid)
++{
++    struct stat sb;
++    if (!hostpath) {
++        return;
++    }
++    if ((nofollow ? lstat(hostpath, &sb) : stat(hostpath, &sb)) == 0) {
++        guest_own_note(&sb, uid, gid);
++    }
++}
++
++static void guest_own_note_fd(int fd, uint32_t uid, uint32_t gid)
++{
++    struct stat sb;
++    if (fstat(fd, &sb) == 0) {
++        guest_own_note(&sb, uid, gid);
++    }
++}
++
+ static void guest_stat_as_root(struct stat *st)
+ {
+     static uid_t me;
+@@ -7939,6 +8169,19 @@
+     if (state != 1) {
+         return;
+     }
++    /*
++     * ★ Сперва — то, что гость назначил сам (карта выше). Это важнее нашего
++     * правила: PackageManagerService сверяет владельца каталога данных с uid
++     * пакета, и без карты он видел бы root и ругался «System UIDs Inconsistent».
++     */
++    {
++        uint32_t ou, og;
++        if (guest_own_get(st->st_dev, st->st_ino, &ou, &og)) {
++            st->st_uid = ou;
++            st->st_gid = og;
++            return;
++        }
++    }
+     if (st->st_uid == me) {
+         st->st_uid = 0;
+     }
+@@ -12279,6 +12522,7 @@
+             return -TARGET_EFAULT;
+         ret = guest_own(get_errno(lchown(path(p), low2highuid(arg2),
+                                        low2highgid(arg3))), "lchown");
++        guest_own_note_path(path(p), 1, arg2, arg3);
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12362,14 +12606,20 @@
+             return guest_ids_setgroups(gidsetsize, grouplist);
+         }
+     case TARGET_NR_fchown:
+-        return guest_own(get_errno(fchown(arg1, low2highuid(arg2),
+-                                        low2highgid(arg3))), "fchown");
++        {
++            abi_long r = guest_own(get_errno(fchown(arg1, low2highuid(arg2),
++                                                  low2highgid(arg3))), "fchown");
++            guest_own_note_fd(arg1, arg2, arg3);
++            return r;
++        }
+ #if defined(TARGET_NR_fchownat)
+     case TARGET_NR_fchownat:
+         if (!(p = lock_user_string(arg2))) 
+             return -TARGET_EFAULT;
+         ret = guest_own(get_errno(fchownat(arg1, path(p), low2highuid(arg3),
+                                          low2highgid(arg4), arg5)), "fchownat");
++        guest_own_note_path(path(p), (arg5 & AT_SYMLINK_NOFOLLOW) ? 1 : 0,
++                          arg3, arg4);
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -12421,6 +12671,7 @@
+             return -TARGET_EFAULT;
+         ret = guest_own(get_errno(chown(path(p), low2highuid(arg2),
+                                       low2highgid(arg3))), "chown");
++        guest_own_note_path(path(p), 0, arg2, arg3);
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12438,6 +12689,7 @@
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+         ret = guest_own(get_errno(lchown(path(p), arg2, arg3)), "lchown32");
++        guest_own_note_path(path(p), 1, arg2, arg3);
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12759,6 +13011,7 @@
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+         ret = guest_own(get_errno(chown(path(p), arg2, arg3)), "chown32");
++        guest_own_note_path(path(p), 0, arg2, arg3);
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif

@@ -1,0 +1,49 @@
+Режим «init прошивки»: SO_PEERSEC — контекст собеседника сокета (только при GUEST_FWINIT=1 И GUEST_SELINUX=1).
+
+Симптом. Служба свойств init 5.0+ после accept спрашивает getpeercon — это
+getsockopt(SOL_SOCKET, SO_PEERSEC) — и по контексту собеседника решает, вправе ли
+тот писать свойство; без ответа запись отклоняется, а в журнале init — «property
+service: permission denied». У servicemanager так же с регистрацией служб.
+
+Причина. getsockopt(SO_PEERSEC) шёл хозяйскому ядру как есть. Хозяин отдал бы
+настоящий контекст процесса qemu в домене приложения телефона (чужой SELinux гостю
+не нужен и выдаёт сведения о хозяине), а у большинства — ENOPROTOOPT.
+
+Решение. В ветке TARGET_SO_PEERSEC (do_getsockopt) при режиме отвечает транслятор:
+собеседник находится по SO_PEERCRED (номер процесса настоящий и ведёт ровно на
+процесс qemu соседа, как в патче 0017 для личности); его контекст — как у чужого
+процесса в /proc/<pid>/attr/current (патч 0086): GUEST_SECON его environ, для
+своего процесса — живое состояние, нет сведений — u:r:init:s0. Ответ — контекст с
+нулём в конце (как ядро); буфер мал — ERANGE и нужная длина в optlen
+(libselinux переспрашивает с нужным размером). Сокет без соседа по SO_PEERCRED
+(не AF_UNIX, не соединён) — ENOPROTOOPT, как у ядра без SELinux. SO_PEERCRED у Linux отвечает
+успехом и на сокетах не-AF_UNIX (TCP: pid 0), и на несоединённых AF_UNIX (pid 0), поэтому
+кроме него проверяются SO_DOMAIN = AF_UNIX и pid соседа не нуль.
+
+⚠️ Контекст соседа — «каким он начал» (GUEST_SECON его environ): записанное им позже
+через setcon отсюда не видно. У сокета, созданного socketpair, соседом оказывается
+процесс, создавший пару (так отвечает и SO_PEERCRED).
+⚠️ Без GUEST_FWINIT=1 или без GUEST_SELINUX=1 вызов идёт хозяину, как прежде.
+
+Проверка: tests/qemu/selinux.sh, случаи «6» и «11» (TCP-сокет и несоединённый AF_UNIX — ENOPROTOOPT).
+
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -2739,8 +2739,14 @@
+                 return -TARGET_EFAULT;
+             }
+             lv = len;
+-            ret = get_errno(getsockopt(sockfd, level, SO_PEERSEC,
+-                                       name, &lv));
++            /*
++             * ★ SELinux «всё разрешено» (патч 0088): контекст собеседника — гостевой
++             * (по SO_PEERCRED и его GUEST_SECON), а не хозяйский. Без режима — как прежде.
++             */
++            if (!guest_selinux_peersec(sockfd, name, &lv, &ret)) {
++                ret = get_errno(getsockopt(sockfd, level, SO_PEERSEC,
++                                           name, &lv));
++            }
+             if (put_user_u32(lv, optlen)) {
+                 ret = -TARGET_EFAULT;
+             }

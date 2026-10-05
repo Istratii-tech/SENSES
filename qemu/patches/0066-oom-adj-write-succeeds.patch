@@ -1,0 +1,78 @@
+Важность процессов гостя: запись в /proc/<pid>/oom_adj — по праву системного процесса.
+
+Симптом (регресс 24.09, Р-23, найдено на №3). На первой загрузке свежего
+дерева процесс медиатеки умер без падения и без строки о снятии:
+«Failed setting oom adj of … android.process.media … to 0», следом
+«Existing provider …MediaProvider is crashing; detaching …» — и диспетчер
+снял поставщика сам.
+
+Причина. Диспетчер активностей гостя ставит важность через СТАРЫЙ файл
+/proc/<pid>/oom_adj (шкала −17…15). На живом аппарате пишет system_server с
+правом CAP_SYS_RESOURCE; у нас — процесс приложения телефона без него, а ядро
+через старый файл без права только ПОВЫШАЕТ число, понижение — EACCES.
+Диспетчер №3 ответ проверяет и на отказе объявляет поставщика умирающим; у
+остальных отказ глотается, но важность у телефона остаётся завышенной.
+
+Теперь запись в старый файл переводится в новый (oom_score_adj) по формуле
+ядра; через новый понижать можно до предела, унаследованного от приложения
+стенда, ниже — прижимаем к нулю. Гостю — «записано»; «процесса нет» — ESRCH,
+как у ядра. Описатель сверяется по узлу перед каждой записью.
+
+Код — в linux-user/guest_oom.c.
+
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -15,6 +15,7 @@
+   'guest_ids.c',
+   'guest_input.c',
+   'guest_net.c',
++  'guest_oom.c',
+   'guest_pagelog.c',
+   'guest_proc.c',
+   'guest_trace.c',
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -163,6 +163,7 @@
+ #include "guest_net.h"
+ #include "guest_proc.h"
+ #include "guest_fs.h"
++#include "guest_oom.h"
+ 
+ /*
+  * ★ Отказ в смене владельца превращаем в успех.
+@@ -10212,6 +10213,11 @@
+         }
+         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
+             return -TARGET_EFAULT;
++        /* ★ Важность процесса для ядра телефона (guest_oom.c, патч 0066). */
++        if (guest_oom_write(arg1, p, arg3, &ret)) {
++            unlock_user(p, arg2, 0);
++            return ret;
++        }
+         if (fd_trans_target_to_host_data(arg1)) {
+             void *copy = g_malloc(arg3);
+             memcpy(copy, p, arg3);
+@@ -10235,6 +10241,7 @@
+                                   arg3, true));
+         fd_trans_unregister(ret);
+         guest_trace_opened(p, ret);
++        guest_oom_opened(p, arg2, ret);
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10246,6 +10253,7 @@
+                                   arg4, true));
+         fd_trans_unregister(ret);
+         guest_trace_opened(p, ret);
++        guest_oom_opened(p, arg3, ret);
+         unlock_user(p, arg2, 0);
+         return ret;
+ #if defined(TARGET_NR_name_to_handle_at) && defined(CONFIG_OPEN_BY_HANDLE)
+@@ -10294,6 +10302,7 @@
+         guest_binder_close(arg1);
+         guest_net_close(arg1);
+         guest_proc_close(arg1);
++        guest_oom_close(arg1);
+         fd_trans_unregister(arg1);
+         return get_errno(close(arg1));
+ #if defined(__NR_close_range) && defined(TARGET_NR_close_range)

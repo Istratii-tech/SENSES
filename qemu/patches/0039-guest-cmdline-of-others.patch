@@ -1,0 +1,229 @@
+★★★★★ /proc/<чужой pid>/cmdline — ГОСТЕВАЯ строка запуска, а не хозяйская.
+
+Из-за этого падал mediaserver, и падал он ровно так, как выглядит чужая ошибка:
+«stack corruption detected» в потоке Binder_1, безо всякой связи со звуком.
+
+ЧТО ПРОИСХОДИЛО. Изготовитель вставил в конструктор AwesomePlayer определение «а не
+CTS-ли это звонит» — и написала его так:
+
+    char путь[255], имя[256];
+    snprintf(путь, 255, "/proc/%d/cmdline", getCallingPid());
+    FILE *f = fopen(путь, "r");
+    if (f) {
+        fscanf(f, "%s", имя);                 // ← предела длины НЕТ
+        ALOGD("Calling process: %s", имя);
+        if (!strncmp(имя, "com.android.cts.media", 21)) …
+    }
+
+На живом телефоне это безобидно: там /proc/<pid>/cmdline короче двух десятков
+байт. У нас же гостевой процесс — это процесс qemu, и ядро отдаёт ЕГО строку
+запуска:
+
+    …/files/bin/guestrun …/files/bin/guest.props.audio 27 …/files/bin/qemu-arm
+    -L …/files/root -0 /system/bin/mediaserver …/files/root/system/bin/mediaserver
+
+Это около 290 байт при буфере в 256. Мало того: в /proc/<pid>/cmdline доводы
+разделены НУЛЯМИ, а не пробелами, и «%s» на них не останавливается — он
+проглатывает строку целиком до конца файла. Канарейка затирается, libc честно
+кричит «порча стека», и mediaserver уходит в SIGABRT.
+
+Отсюда и вся картина, которая раньше не складывалась:
+  • падает не сам mediaserver, а тот его поток, куда пришёл ЧУЖОЙ вызов
+    (getCallingPid имеет смысл только там) — оттого «Binder_1»;
+  • падает через раз: смотря кто позвал и есть ли у того /proc;
+  • запущенный вручную через четверть часа живёт — к нему просто никто не
+    приходил с MediaPlayer;
+  • вендорский модуль OMX был ни при чём (проверено удалением — не помогло).
+
+ЛЕЧЕНИЕ. Гостю незачем видеть хозяйскую строку запуска — ни по длине, ни по
+содержанию (там наши пути в песочнице приложения, см. патч 0031). Свою
+собственную он и так получает гостевую: qemu подменяет /proc/self/cmdline,
+отдавая argv гостя из bprm. Не хватало ровно того же для ЧУЖОГО номера.
+
+Собрать гостевую строку по хозяйской можно точно, без единого нового файла и
+без сговора между процессами: наш запуск имеет твёрдую форму
+
+    [guestrun <область> <fd>]  qemu-arm  -L <корень>  -0 <программа>  \
+    [-d … -D …]  <корень><программа>  <доводы гостя…>
+
+Отсюда «-L» даёт корень, «-0» — гостевое имя, а всё, что идёт после хозяйского
+пути (это в точности корень+имя), и есть доводы гостя. Получается ровно то же,
+что qemu отдаёт про самого себя, — и для потомков зиготы тоже, потому что у них
+строка запуска унаследована от родителя, как и bprm.
+
+Не распознали форму (значит номер принадлежит не нашему гостю) — отдаём одно
+короткое имя файла без пути. Хозяйских путей гость не увидит в любом случае.
+
+⚠️ Своё не трогаем: /proc/<свой pid>/cmdline и /proc/self/cmdline обслуживает
+open_self_cmdline, он точнее.
+
+⚠️ Не нашли процесса (fopen отказал) — не вмешиваемся вовсе, пусть отвечает
+ядро своим ENOENT: гость должен уметь отличать «нет такого процесса».
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -8994,6 +8994,148 @@
+     return flags;
+ }
+ 
++/*
++ * ★★★ ЧУЖАЯ СТРОКА ЗАПУСКА — ГОСТЕВАЯ.
++ *
++ * Подробности и история — в заголовке патча. Коротко: гостевой процесс это
++ * процесс qemu, и ядро отдаёт про него НАШУ строку запуска — втрое длиннее
++ * настоящей и с хозяйскими путями внутри. Прошивка на такое не рассчитана:
++ * fscanf("%s") в AwesomePlayer сносил ей канарейку и валил mediaserver.
++ *
++ * Возвращаем 1, если ответ наш (в *out — готовый дескриптор либо -errno).
++ */
++static int guest_cmdline_of_other(const char *pathname, int *out)
++{
++    char host[64];
++    char buf[4096];
++    char res[2048];
++    const char *tok[128];
++    const char *root = NULL, *prog = NULL;
++    char full[1024];
++    long pid;
++    char *end;
++    size_t used = 0;
++    int fd, i, n, ntok = 0, first = -1;
++
++    if (strncmp(pathname, "/proc/", 6) != 0) {
++        return 0;
++    }
++    pid = strtol(pathname + 6, &end, 10);
++    if (end == pathname + 6 || strcmp(end, "/cmdline") != 0 || pid <= 0) {
++        return 0;
++    }
++    if (pid == (long)getpid()) {
++        return 0;               /* своё отдаёт open_self_cmdline — он точнее */
++    }
++
++    snprintf(host, sizeof host, "/proc/%ld/cmdline", pid);
++    fd = open(host, O_RDONLY);
++    if (fd < 0) {
++        return 0;               /* нет процесса — пусть отвечает ядро */
++    }
++    n = (int)read(fd, buf, sizeof buf - 1);
++    close(fd);
++    if (n <= 0) {
++        return 0;
++    }
++    buf[n] = 0;
++
++    /* Доводы в /proc/<pid>/cmdline разделены нулями. */
++    for (i = 0; i < n && ntok < (int)(sizeof tok / sizeof tok[0]); ) {
++        tok[ntok++] = buf + i;
++        while (i < n && buf[i]) {
++            i++;
++        }
++        i++;
++    }
++    if (ntok == 0) {
++        return 0;
++    }
++
++    /* Наша форма запуска: … -L <корень> … -0 <программа> … */
++    for (i = 0; i + 1 < ntok; i++) {
++        if (strcmp(tok[i], "-L") == 0 && !root) {
++            root = tok[i + 1];
++        } else if (strcmp(tok[i], "-0") == 0 && !prog) {
++            prog = tok[i + 1];
++        }
++    }
++
++    if (root && prog) {
++        /*
++         * Хозяйский путь к самой программе — это корень плюс гостевое имя.
++         * Всё, что идёт ПОСЛЕ него, — доводы гостя; всё, что до, — наши
++         * собственные ключи, гостю их знать незачем.
++         */
++        snprintf(full, sizeof full, "%s%s", root, prog);
++        for (i = 0; i < ntok; i++) {
++            if (strcmp(tok[i], full) == 0) {
++                first = i + 1;
++                break;
++            }
++        }
++    }
++
++    if (first < 0) {
++        /*
++         * Не наш гость (или форма изменилась). Хозяйские пути всё равно не
++         * показываем: отдаём одно короткое имя файла.
++         */
++        const char *slash = strrchr(tok[0], '/');
++        const char *name = slash ? slash + 1 : tok[0];
++        size_t len = strlen(name);
++
++        if (len >= sizeof res) {
++            len = sizeof res - 1;
++        }
++        memcpy(res, name, len);
++        res[len] = 0;
++        used = len + 1;
++    } else {
++        size_t len = strlen(prog);
++
++        if (len + 1 > sizeof res) {
++            return 0;
++        }
++        memcpy(res, prog, len + 1);
++        used = len + 1;
++        for (i = first; i < ntok; i++) {
++            len = strlen(tok[i]);
++            if (used + len + 1 > sizeof res) {
++                break;
++            }
++            memcpy(res + used, tok[i], len + 1);
++            used += len + 1;
++        }
++    }
++
++    /*
++     * Отдаём как файл в памяти — ровно так же, как qemu отдаёт остальные
++     * подложные записи /proc.
++     */
++    fd = memfd_create("qemu-cmdline", 0);
++    if (fd < 0) {
++        char tmp[1024];
++        const char *tmpdir = getenv("TMPDIR");
++
++        if (!tmpdir) {
++            tmpdir = "/tmp";
++        }
++        snprintf(tmp, sizeof tmp, "%s/qemu-cmdline.XXXXXX", tmpdir);
++        fd = mkstemp(tmp);
++        if (fd < 0) {
++            return 0;
++        }
++        unlink(tmp);
++    }
++    if (write(fd, res, used) != (ssize_t)used || lseek(fd, 0, SEEK_SET) != 0) {
++        close(fd);
++        return 0;
++    }
++    *out = fd;
++    return 1;
++}
++
+ int do_guest_openat(CPUArchState *cpu_env, int dirfd, const char *fname,
+                     int flags, mode_t mode, bool safe)
+ {
+@@ -9046,6 +9193,15 @@
+         }
+     }
+ 
++    /* ★★★ Чужой /proc/<pid>/cmdline — гостевой (см. пояснение выше). */
++    {
++        int cfd;
++
++        if (guest_cmdline_of_other(pathname, &cfd)) {
++            return cfd;
++        }
++    }
++
+     for (fake_open = fakes; fake_open->filename; fake_open++) {
+         if (fake_open->cmp(pathname, fake_open->filename)) {
+             break;

@@ -1,0 +1,67 @@
+readlink: ядро спрашиваем в полный буфер, гостю отдаём гостевой путь целиком.
+
+Симптом (регресс 24.09, Р-18, найдено на №3). Изнутри гостя
+`readlink /data/data/<пакет>/lib` отдавал обрезанную цель:
+«/data/app-lib/com.vendor.files.r» — а `ls -l` той же ссылки показывал
+целиком «/data/app-lib/com.vendor.files.rootbrowser».
+
+Причина — в переводе из 0063. Ссылки гостя с абсолютной целью лежат у ядра
+с хозяйским путём (корень дерева + гостевой путь), он длиннее гостевого на
+47 байт. readlink шёл к ядру с гостевым буфером и его размером: ядро
+обрезало хозяйский путь по этому размеру, и переводился уже обрезанный.
+Буфер toolbox — 80 байт, и 80 байт хозяйского пути — это 33 байта гостевого.
+
+Теперь ядро отвечает в свой буфер PATH_MAX, ответ переводится в гостевой
+путь и только потом отдаётся гостю — сколько влезает в его буфер, как и
+велит readlink. Обе дороги: readlink и readlinkat.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9490,10 +9490,24 @@
+         /* We cannot NUL terminate the string. */
+         memcpy(buf, exec_path, ret);
+     } else {
+-        ret = readlink(path(pathname), buf, bufsiz);
+-        /* ★ Гостю — гостевой путь, а не хозяйский (Р-2, см. util/path.c). */
+-        if (ret > 0) {
+-            ret = path_link_to_guest(buf, ret, bufsiz);
++        /*
++         * ★ Гостю — гостевой путь, а не хозяйский (Р-2, см. util/path.c).
++         *
++         * ⚠️ Спрашиваем ядро В СВОЙ ПОЛНЫЙ БУФЕР, а не в гостевой (0065):
++         * хозяйский путь длиннее гостевого на корень дерева, и ядро обрезало
++         * его по гостевому размеру раньше перевода. С буфером на 80 байт гость
++         * получал «/data/app-lib/com.vendor.files.r» вместо целого имени,
++         * хотя его собственный путь в 80 байт влезал.
++         */
++        char hb[PATH_MAX];
++        ssize_t n = readlink(path(pathname), hb, sizeof hb);
++
++        if (n > 0) {
++            n = path_link_to_guest(hb, n, sizeof hb);
++            ret = MIN((size_t)n, bufsiz);
++            memcpy(buf, hb, ret);
++        } else {
++            ret = n;
+         }
+     }
+ 
+@@ -11621,9 +11635,16 @@
+                 /* We cannot NUL terminate the string. */
+                 memcpy(p2, exec_path, ret);
+             } else {
+-                ret = get_errno(readlinkat(arg1, path_at(arg1, p), p2, arg4));
++                /* ⚠️ В свой полный буфер, а не в гостевой — см. do_guest_readlink. */
++                char hb[PATH_MAX];
++
++                ret = get_errno(readlinkat(arg1, path_at(arg1, p), hb, sizeof hb));
+                 if (!is_error(ret) && ret > 0) {
+-                    ret = path_link_to_guest(p2, ret, arg4);
++                    ret = path_link_to_guest(hb, ret, sizeof hb);
++                    if (ret > arg4) {
++                        ret = arg4;
++                    }
++                    memcpy(p2, hb, ret);
+                 }
+             }
+             unlock_user(p2, arg3, ret);

@@ -1,0 +1,58 @@
+Возврат из обработчика сигнала в Thumb: бит 0 восстановленного PC сбрасывается (sigreturn и rt_sigreturn).
+
+Симптом (регресс Р-80). У №9 (5.0.2, «план») процесс systemui умирает каждые ~3 с
+тихо. В files/bin/zygote.log на КАЖДУЮ смерть:
+
+  Assertion failed: (dc->base.pc_next & 1) == 0 (../target/arm/tcg/translate.c: thumb_tr_translate_insn: 9428)
+
+— то есть сам транслятор падает (abort). Журнал сигналов гостя (патч 0090) показал,
+что гость в петле сигналов не шлёт: никто systemui не убивает.
+
+Причина. ART 5.0 ловит обращения к нулевой ссылке в скомпилированном коде сигналом
+SIGSEGV. Его обработчик (fault_handler_arm.cc, NullPointerHandler) пишет в
+сохранённый контекст arm_pc = адрес Thumb-функции art_quick_throw_null_pointer_
+exception — С БИТОМ 0 = 1 — и возвращается. Ядро и железо в состоянии Thumb бит 0
+PC при возврате игнорируют (BranchWritePC: в Thumb PC<0> = 0), а restore_sigcontext
+(linux-user/arm/signal.c) клал нечётный PC в env->regs[15] как есть: блок трансляции
+с нечётного адреса — assert и abort всего процесса.
+
+Решение. После восстановления CPSR (cpsr_write) — если процессор вернётся в состоянии
+Thumb (env->thumb, то есть T в восстановленном CPSR), бит 0 восстановленного PC
+сбрасывается. restore_sigcontext зовёт do_sigframe_return, а его — и do_sigreturn
+(кадр sigframe, без SA_SIGINFO), и do_rt_sigreturn (кадр rt_sigframe, SA_SIGINFO):
+в qemu 8.2.4 путь у них один (контекст в обоих — ucontext), поэтому правка в одном
+месте покрывает обе версии и sigcontext, и ucontext.
+
+⚠️ В состоянии ARM PC не трогается — как прежде. Сверено с ядром Linux
+(arch/arm/kernel/signal.c, restore_sigframe): arm_pc и arm_cpsr копируются как есть,
+дальше возврат в пользовательский режим (SPSR → CPSR); бит 0 в Thumb отбрасывает
+само железо. Выравнивание PC в состоянии ARM по ARM ARM — «не определено», подгонять
+его мы не берёмся. Обратный путь (вход в обработчик, setup_return) уже делает
+`handler & (thumb ? ~1 : ~3)` — его правка не нужна.
+⚠️ Меняется только возврат из обработчика с изменённым PC. Обычный возврат (PC —
+адрес прерванной команды, чётный) идёт ровно как прежде.
+⚠️ Патч не трогает файлы, правимые другими патчами набора; ложится и на 0083, и
+поверх 0084–0089 (fw-3a). Файл linux-user/arm/signal.c — новый в списке изменённых
+(NOTICE).
+
+Проверка: tests/qemu/sigpc.sh (программа tests/qemu/sigpc.c, Thumb и ARM).
+
+--- a/linux-user/arm/signal.c
++++ b/linux-user/arm/signal.c
+@@ -399,6 +399,16 @@
+     __get_user(env->regs[15], &sc->arm_pc);
+     __get_user(cpsr, &sc->arm_cpsr);
+     cpsr_write(env, cpsr, CPSR_USER | CPSR_EXEC, CPSRWriteByInstr);
++    /*
++     * ★ Р-80 (патч 0091): в состоянии Thumb бит 0 PC — не адрес. ART 5.0 пишет
++     * в arm_pc адрес Thumb-функции с битом 0 = 1 и возвращается; железо при
++     * возврате в Thumb этот бит отбрасывает (BranchWritePC), а нечётный PC тут
++     * дал бы блок трансляции с нечётного адреса — assert и abort процесса.
++     * Состояние берём из восстановленного CPSR (T), PC в состоянии ARM не трогаем.
++     */
++    if (env->thumb) {
++        env->regs[15] &= ~1;
++    }
+ 
+     err |= !valid_user_regs(env);
+ 

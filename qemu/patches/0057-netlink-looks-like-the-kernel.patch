@@ -1,0 +1,119 @@
+Подставной netlink обязан ВЫГЛЯДЕТЬ ядром, иначе ответ выбрасывают не читая.
+
+Что было. `netd` третьей прошивки запускает `/system/bin/ip rule flush`, тот
+висит вечно, `netd` стоит на чтении его вывода и не доходит до приёма команд —
+а значит нет ни имён, ни конца загрузки. Лечили пустышкой вместо `ip`; это
+лечение следствия, причина — здесь.
+
+Разбор. Отвечали мы правильно по существу (дамп плюс NLMSG_DONE), и в журнале
+стояло честное «запрос типа 34 — ответили 20 Б». Но у netlink нет соединения:
+и запрос, и ответ — датаграммы, и потребитель отличает свой ответ от чужого по
+ТРЁМ полям сразу. Вот проверка из libnetlink, по которой живёт всякий `ip`:
+
+    if (nladdr.nl_pid != 0 ||                  ← пришло НЕ от ядра
+        h->nlmsg_pid != rth->local.nl_pid ||   ← адресовано НЕ НАМ
+        h->nlmsg_seq != rth->dump)             ← не на наш запрос
+            goto skip_it;                      ← выбросить молча и читать дальше
+
+Совпадал у нас только номер запроса. Два других не совпадали НИКОГДА:
+
+  * `nlmsg_pid` в ответе мы копировали ИЗ ЗАПРОСА, а там ноль: libnetlink шлёт
+    запрос с нулевым pid и ждёт в ответе СВОЙ номер порта — тот, что выдало
+    ядро при привязке;
+  * адрес отправителя пара AF_UNIX не заполняет вовсе (recvmsg отдаёт
+    msg_namelen = 0, буфера не касаясь), и у потребителя там остаётся мусор со
+    стека — `nl_pid != 0` почти наверняка.
+
+Ответ выбрасывался целиком, потребитель шёл читать снова, а второго ответа не
+будет — вот и «висит в recvmsg, wchan = __skb_wait_for_more_packets».
+
+Третье, помельче, но столь же смертельное: `rtnl_open` сразу после bind делает
+getsockname и проверяет семейство и длину:
+
+    if (addr_len != sizeof(rth->local)) → «Wrong address length %d»
+    if (rth->local.nl_family != AF_NETLINK) → «Wrong address family %d»
+
+За нашим дескриптором стоит AF_UNIX: ответ был бы «семейство 1, длина 2», то
+есть отказ ещё до первого запроса.
+
+Что делаем здесь. Четыре точки: bind (запомнить номер порта и группы),
+getsockname (назваться netlink'ом), recvfrom и recvmsg (сказать, что ответ
+пришёл от ядра). Сам разбор и сборка ответов — в linux-user/guest_net.c.
+
+⚠️ Номер порта у забранного сокета снимается ДО подмены: потребитель уже
+спросил его у ядра и запомнил, а после dup2 спрашивать будет не у кого.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3366,8 +3366,17 @@
+         return -TARGET_EINVAL;
+     }
+ 
+-    /* Подставной netlink: гость шлёт сюда sockaddr_nl, для AF_UNIX пустой. */
++    /*
++     * Подставной netlink: гость шлёт сюда sockaddr_nl, для AF_UNIX пустой.
++     * ★ Но прочитать его надо: в нём номер порта, которым гость будет себя
++     * звать, и группы, на которые он подписывается. Ответы обязаны нести
++     * именно этот номер — иначе потребитель их выбрасывает (guest_net.c).
++     */
+     if (guest_net_owns(sockfd)) {
++        addr = alloca(MAX(addrlen + 1, sizeof(struct sockaddr_un)));
++        if (target_to_host_sockaddr(sockfd, addr, target_addr, addrlen) == 0) {
++            guest_net_bound(sockfd, addr, addrlen);
++        }
+         return 0;
+     }
+ 
+@@ -3549,8 +3558,24 @@
+             }
+         }
+     } else {
++        /*
++         * ★ Ёмкость буфера имени запоминаем ДО вызова: recvmsg перепишет
++         * msg_namelen действительной длиной (у пары AF_UNIX — нулём), а нам
++         * нужно знать, сколько байт гость готов принять.
++         */
++        socklen_t namecap = msg.msg_name ? msg.msg_namelen : 0;
++
+         ret = get_errno(safe_recvmsg(fd, &msg, flags));
+         if (!is_error(ret)) {
++            /*
++             * ★★★ Подставной netlink: говорим, что ответ пришёл ОТ ЯДРА.
++             * Именно по этому полю libnetlink отличает свой ответ от чужого:
++             *   if (nladdr.nl_pid != 0) goto skip_it;
++             * Без подстановки там лежит мусор со стека потребителя, ответ
++             * выбрасывается, и следующее чтение не кончается никогда —
++             * повисший `ip rule flush` держал netd и всю загрузку.
++             */
++            guest_net_from_kernel(fd, msg.msg_name, namecap, &msg.msg_namelen);
+             len = ret;
+             if (fd_trans_host_to_target_data(fd)) {
+                 ret = fd_trans_host_to_target_data(fd)(msg.msg_iov->iov_base,
+@@ -3752,6 +3777,14 @@
+ 
+     ret_addrlen = addrlen;
+     ret = get_errno(getsockname(fd, addr, &ret_addrlen));
++    /*
++     * ★ Подставной netlink обязан называться netlink'ом: за дескриптором у нас
++     * AF_UNIX, а `ip` прошивки сверяет семейство и длину сразу после bind и
++     * отказывается работать вовсе («Wrong address family 1»). См. guest_net.c.
++     */
++    if (guest_net_sockname(fd, addr, addrlen, &ret_addrlen)) {
++        ret = 0;
++    }
+     if (!is_error(ret)) {
+         host_to_target_sockaddr(target_addr, addr, MIN(addrlen, ret_addrlen));
+         if (put_user_u32(ret_addrlen, target_addrlen_addr)) {
+@@ -3887,6 +3920,12 @@
+         }
+         if (target_addr) {
+             /*
++             * ★ Ответ подставного netlink выдаём ОТ ЯДРА: пара AF_UNIX
++             * отправителя не называет вовсе, и потребитель читает со стека
++             * мусор, а потом выбрасывает наш ответ (см. guest_net.c).
++             */
++            guest_net_from_kernel(fd, addr, addrlen, &ret_addrlen);
++            /*
+              * ★ Ответ нашего ответчика имён выдаём «от того сервера», которого
+              * гость спрашивал: иначе резолвер bionic его выбросит
+              * (см. guest_net.c).

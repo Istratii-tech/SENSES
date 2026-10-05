@@ -1,0 +1,42 @@
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -10521,7 +10521,38 @@
+ #endif
+         return ret;
+     case TARGET_NR_setpriority:
+-        return get_errno(setpriority(arg1, arg2, arg3));
++        /*
++         * ★ Повышение важности потока — прощаем отказ.
++         *
++         * SystemServer 4.4 первым делом делает
++         *   Process.setThreadPriority(THREAD_PRIORITY_FOREGROUND)   // nice = -2
++         * (ServerThread.initAndLoop), а отрицательный nice обычному
++         * пользователю не разрешён: setpriority отвечает EACCES, JNI Android
++         * превращает это в SecurityException, и system_server падает насмерть:
++         *
++         *   E AndroidRuntime *** FATAL EXCEPTION IN SYSTEM PROCESS: main
++         *   E AndroidRuntime java.lang.SecurityException: No permission to set to given priority
++         *
++         * На живом устройстве это работает, потому что приложениям поднимают
++         * RLIMIT_NICE; ни на обычном Linux, ни в песочнице приложения на телефоне такой
++         * поблажки нет, а поднять предел без root нельзя.
++         *
++         * Врём ровно в одном: говорим «сделано». Важность потока остаётся
++         * прежней — под трансляцией она всё равно ничего не решает, потоки
++         * гостя для планировщика хозяина неразличимы.
++         *
++         * ⚠️ Понижение важности (nice > 0) не трогаем: оно разрешено и
++         * действительно выполняется. Прощаем ТОЛЬКО отказ по правам, прочие
++         * ошибки (ESRCH — нет такого потока) уходят гостю как есть, иначе мы
++         * скрыли бы настоящую поломку.
++         */
++        {
++            abi_long pr = get_errno(setpriority(arg1, arg2, arg3));
++            if (is_error(pr) && (pr == -TARGET_EACCES || pr == -TARGET_EPERM)) {
++                pr = 0;
++            }
++            return pr;
++        }
+ #ifdef TARGET_NR_statfs
+     case TARGET_NR_statfs:
+         if (!(p = lock_user_string(arg1))) {

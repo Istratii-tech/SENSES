@@ -1,0 +1,31 @@
+Отказ mprotect гостю — в журнал: молча его терять нельзя.
+
+Зачем. Движок JavaScript резервирует область под свой код целиком (PROT_NONE) и
+доводит её кусками через mprotect(READ|WRITE|EXEC). Если такой mprotect
+откажет, движок узнает об этом не сразу, а прыжком в невыданную память:
+
+  Fatal signal 11 (SIGSEGV) at 0x34dc9b20     ← адрес отказа РАВЕН PC
+  qemu: PC=0x34dc9b20 в 3464b000-36d00000 ---p
+
+Отличить «гость прыгнул не туда» от «мы не дали ему память» без этой строки
+нельзя. Отказ редок, так что журнал не заплывёт.
+
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -253,7 +253,16 @@
+     for (int i = 0; i < nranges; ++i) {
+         ret = mprotect(g2h_untagged(starts[i]), lens[i],
+                        target_to_host_prot(prots[i]));
+         if (ret != 0) {
++            /*
++             * ★ Гость просил права, хозяин отказал. Молчать нельзя: гость
++             * почти наверняка сочтёт память своей и прыгнет в неё.
++             */
++            fprintf(stderr,
++                    "qemu: ★ mprotect гостю ОТКАЗАН: 0x%08lx+0x%lx права 0x%x "
++                    "— %s\n", (unsigned long)starts[i], (unsigned long)lens[i],
++                    prots[i], strerror(errno));
++            fflush(stderr);
+             goto error;
+         }
+     }

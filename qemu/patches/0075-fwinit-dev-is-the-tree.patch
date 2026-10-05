@@ -1,0 +1,105 @@
+Режим «init прошивки»: /dev гостя — целиком его дерево (только при GUEST_FWINIT=1).
+
+Симптом. Настоящий /init прошивки, запущенный под транслятором, на первых же
+строках создаёт узлы и сокеты в /dev: mknod("/dev/__null__"), mkdir("/dev/socket"),
+сокет службы свойств. Эти пути шли ХОЗЯИНУ: у приложения Android нет права писать
+в его /dev, у виртуалки это не наш каталог. Отказ — и init выходил с кодом 1.
+
+Причина. /dev целиком в guest_write_roots не входит намеренно (там живут
+хозяйские устройства, которые гостю нужны), а входят только /dev/socket и
+/dev/cpuctl. Служебная работа init с /dev туда не помещалась.
+
+Решение. При GUEST_FWINIT=1 любой гостевой путь под /dev уводится в дерево
+безусловно, КРОМЕ null, zero, full, random, urandom, tty, ptmx и pts: это
+безвредные устройства без состояния, они остаются хозяйскими. Поддельные
+устройства (binder, ashmem, кадры, ввод) ловятся по ГОСТЕВОМУ имени до перевода
+пути и этого не касаются. Каталог dev в дереве готовит стенд (договор «ядро для
+init»); нет его — гость получит ENOENT.
+
+Тот же патч вносит в сборку qemu/src/guest_fwinit.c (строка в meson.build): в
+нём живёт весь режим, остальные патчи 0076–0083 только вешают вызовы.
+
+⚠️ Без GUEST_FWINIT=1 поведение ровно прежнее. Переменная читается один раз:
+решения path() кэшируются навсегда. Режим включает только значение «1» («0»,
+«10», «1x» — нет).
+⚠️ То же условие стоит и в qemu/src/guest_fwinit.c (guest_fwinit): util/ не
+вправе зависеть от linux-user/, общей функции нет — менять в обоих местах.
+⚠️ Узлы устройств, которых хозяин создать не даёт, создаёт заглушка mknod
+(патч 0076).
+
+Проверка: tests/qemu/fwinit.sh, случаи «1».
+
+--- a/util/path.c
++++ b/util/path.c
+@@ -121,10 +121,61 @@
+     NULL
+ };
+ 
++/*
++ * ★★★ РЕЖИМ «INIT ПРОШИВКИ» (GUEST_FWINIT=1): /dev гостя — целиком его дерево.
++ *
++ * Настоящий /init монтирует tmpfs на /dev (у нас mount — пустой вызов) и дальше
++ * создаёт там узлы, каталоги, сокеты служб, а потом ждёт их. У хозяина писать в
++ * /dev некуда: у приложения нет прав, у виртуалки это не наш каталог. Поэтому
++ * весь /dev гостя — каталог dev его дерева (его готовит стенд), КРОМЕ безвредных
++ * устройств без состояния: null, zero, full, random, urandom, tty, ptmx, pts —
++ * они остаются хозяйскими. Поддельные устройства (binder, ashmem, кадры, ввод,
++ * журналы) ловятся по ГОСТЕВОМУ имени ещё до перевода пути (guest_binder_try_open
++ * и соседи) и этого не касаются.
++ *
++ * ⚠️ Переменная читается один раз: решения path() кэшируются навсегда, и ответ
++ * для одного пути не должен меняться на лету. Без переменной поведение прежнее.
++ * ⚠️ Условие «GUEST_FWINIT равно 1» записано здесь и в linux-user/guest_fwinit.c
++ * (guest_fwinit): util/ собирается отдельно от linux-user/ и не вправе зависеть
++ * от него, поэтому общей функции нет. Правишь одно — правь и второе.
++ */
++static bool fwinit_dev(const char *name)
++{
++    static int on = -1;
++    static const char *const host_dev[] = {
++        "/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom",
++        "/dev/tty", "/dev/ptmx", "/dev/pts", NULL
++    };
++    int i;
++
++    if (on < 0) {
++        const char *e = getenv("GUEST_FWINIT");
++
++        on = e && strcmp(e, "1") == 0;      /* ровно «1»: «0», «10», «1x» — нет */
++    }
++    if (!on || strncmp(name, "/dev", 4) != 0 ||
++        (name[4] != '/' && name[4] != '\0')) {
++        return false;
++    }
++    for (i = 0; host_dev[i]; i++) {
++        size_t n = strlen(host_dev[i]);
++
++        if (strncmp(name, host_dev[i], n) == 0 &&
++            (name[n] == '/' || name[n] == '\0')) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ static bool under_guest_write_root(const char *name)
+ {
+     int i;
+ 
++    if (fwinit_dev(name)) {
++        return true;
++    }
++
+     for (i = 0; guest_write_roots[i]; i++) {
+         size_t n = strlen(guest_write_roots[i]);
+ 
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -12,6 +12,7 @@
+   'guest_binder.c',
+   'guest_fb.c',
+   'guest_fs.c',
++  'guest_fwinit.c',
+   'guest_ids.c',
+   'guest_input.c',
+   'guest_net.c',

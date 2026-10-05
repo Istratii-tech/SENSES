@@ -1,0 +1,75 @@
+Свои ветви гостя уводить под корень ВСЕГДА, а не только когда файл уже есть.
+
+`path()` подменяет гостевой путь на путь под корнем (`-L`) только если файл там
+УЖЕ существует. Для чтения прошивки этого хватает, а на первой же записи гость
+уходит к хозяину:
+
+  guest# echo proba > /data/proba.txt
+  sh: can't create /data/proba.txt: Permission denied     ← это ХОЗЯЙСКИЙ /data
+
+Так же ломается dexopt: Dalvik создаёт odex в /data/dalvik-cache и без записи
+не запускает ни один свой класс.
+
+Правило простое: у ветвей, которые гость считает своими и в которые пишет
+(/data, /cache, /mnt, /tmp, /sqlite_stmt_journals), путь уводится под корень
+безусловно — файла может ещё не быть, важно, что создан он должен быть ТАМ.
+
+Почему список, а не «всё подряд»: /proc, /sys и /dev гостю нужны ХОЗЯЙСКИЕ —
+их подменяет сам qemu (/proc/self/maps, /proc/self/exe) либо они и должны быть
+настоящими. Загони /proc под корень целиком — гость перестанет читать cpuinfo и
+meminfo, а это тихая порча вместо честного отказа.
+
+⚠️ Кэш решений в path.c вечный (GHashTable на всю жизнь процесса). Для наших
+ветвей это безвредно: ответ для них всегда один и тот же путь под корнем. А для
+остальных ветвей отрицательный ответ кэшируется — файл, созданный позже по
+такому пути, подменяться уже не будет. Знать об этом надо: если что-то
+появляется в дереве во время работы гостя, оно должно лежать под нашими ветвями.
+
+--- a/util/path.c
++++ b/util/path.c
+@@ -14,6 +14,34 @@
+ static GHashTable *hash;
+ static QemuMutex lock;
+ 
++/*
++ * Ветви, которые гость считает своими и в которые ПИШЕТ. Их пути уводятся под
++ * корень безусловно, даже если файла там ещё нет: иначе создание уходит
++ * хозяину, где у нас нет прав (в песочнице приложения — Permission denied).
++ *
++ * /proc, /sys и /dev сюда НЕ входят намеренно: /proc и /sys гостю нужны
++ * настоящие (часть их подменяет сам qemu), а из /dev под корнем берётся только
++ * то, что мы создали там сами.
++ */
++static const char *const guest_write_roots[] = {
++    "/data", "/cache", "/mnt", "/tmp", "/sqlite_stmt_journals", NULL
++};
++
++static bool under_guest_write_root(const char *name)
++{
++    int i;
++
++    for (i = 0; guest_write_roots[i]; i++) {
++        size_t n = strlen(guest_write_roots[i]);
++
++        if (strncmp(name, guest_write_roots[i], n) == 0 &&
++            (name[n] == '/' || name[n] == '\0')) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ void init_paths(const char *prefix)
+ {
+     if (prefix[0] == '\0' || !strcmp(prefix, "/")) {
+@@ -57,6 +85,10 @@
+             /* Exists.  */
+             g_hash_table_insert(hash, save, full);
+             ret = full;
++        } else if (under_guest_write_root(name)) {
++            /* Своя ветвь гостя: создавать надо ПОД КОРНЕМ, а не у хозяина. */
++            g_hash_table_insert(hash, save, full);
++            ret = full;
+         } else {
+             /* Does not exist.  */
+             g_free(full);

@@ -1,0 +1,115 @@
+--- a/linux-user/signal.c	2026-09-05 17:23:43.825495178 +0300
++++ b/linux-user/signal.c	2026-09-05 17:23:43.826495178 +0300
+@@ -737,6 +737,92 @@
+     _exit(EXIT_FAILURE);
+ }
+ 
++/*
++ * ★ Байты вокруг адреса — чтобы увидеть САМУ команду, передавшую управление.
++ *
++ * Гостевая память лежит в адресном пространстве транслятора, так что читать её
++ * можно прямо; безопасность даёт проверка прав гостя, а не надежда.
++ */
++static void guest_addr_bytes(const char *tag, unsigned long a, int before, int after)
++{
++    unsigned long lo = a - before, i;
++
++    if (!(page_get_flags(lo) & PAGE_READ) ||
++        !(page_get_flags(a + after) & PAGE_READ)) {
++        return;
++    }
++    fprintf(stderr, "qemu: байты у %s (0x%08lx-0x%08lx):", tag, lo, a + after);
++    for (i = lo; i <= a + after; i += 2) {
++        fprintf(stderr, " %04x", *(const uint16_t *)g2h_untagged(i));
++    }
++    fprintf(stderr, "\n");
++}
++
++/*
++ * ★ Права страницы ГЛАЗАМИ ТРАНСЛЯТОРА — не то же самое, что в /proc/self/maps.
++ *
++ * Хозяйские отображения показывают, что сделал транслятор; гостевые права —
++ * что он ОБЕЩАЛ гостю. Расхождение между ними и есть ответ на вопрос «почему
++ * прыгнули туда, где ничего нет»: либо гость прыгнул в память, которой ему не
++ * выдавали (тогда виноват гость), либо права ему выданы, а хозяйской памяти за
++ * ними нет (тогда виноваты мы).
++ */
++static const char *guest_guest_prot(unsigned long a)
++{
++    static char buf[32];
++    int f = page_get_flags(a);
++
++    if (!(f & PAGE_VALID)) {
++        return "страница не выдавалась";
++    }
++    snprintf(buf, sizeof buf, "%c%c%c",
++             (f & PAGE_READ) ? 'r' : '-',
++             (f & PAGE_WRITE) ? 'w' : '-',
++             (f & PAGE_EXEC) ? 'x' : '-');
++    return buf;
++}
++
++/*
++ * ★★★ КУДА ИМЕННО УПАЛ ГОСТЬ.
++ *
++ * Гостевые падения в стенде немы: debuggerd прошивки поднять нельзя (он читает
++ * чужие регистры через ptrace, а под трансляцией регистры не те), тела процесса
++ * нет, и всё, что видно, — строка «Fatal signal 11 (SIGSEGV) at 0x00000000».
++ * По ней место не найти: адрес нуля говорит лишь «прыгнули в пустоту».
++ *
++ * А транслятор знает точно: у него в руках весь процессор гостя. Печатаем
++ * регистры и, главное, разбираем PC и LR по отображениям — гостевые библиотеки
++ * лежат в АДРЕСНОМ ПРОСТРАНСТВЕ САМОГО qemu, поэтому /proc/self/maps даёт имя
++ * файла и смещение в нём. Дальше место находится обычным дизассемблером.
++ */
++static void guest_addr_where(const char *tag, unsigned long a)
++{
++    FILE *m = fopen("/proc/self/maps", "r");
++    char line[512];
++
++    if (!m) {
++        return;
++    }
++    while (fgets(line, sizeof line, m)) {
++        unsigned long lo, hi;
++        char *nl;
++
++        if (sscanf(line, "%lx-%lx", &lo, &hi) != 2 || a < lo || a >= hi) {
++            continue;
++        }
++        nl = strchr(line, '\n');
++        if (nl) {
++            *nl = 0;
++        }
++        fprintf(stderr, "qemu: %s=0x%08lx (+0x%lx) [гость: %s] в %s\n",
++                tag, a, a - lo, guest_guest_prot(a), line);
++        fclose(m);
++        return;
++    }
++    fclose(m);
++    fprintf(stderr, "qemu: %s=0x%08lx — вне отображений\n", tag, a);
++}
++
+ static G_NORETURN
+ void dump_core_and_abort(CPUArchState *env, int target_sig)
+ {
+@@ -770,6 +770,19 @@
+             target_sig, strsignal(host_sig), "core dumped" );
+     }
+ 
++    /* ★ Отчёт о падении гостя — до выхода, пока состояние ещё цело. */
++    fprintf(stderr, "qemu: ★ гость упал, сигнал %d (%s); состояние процессора:\n",
++            target_sig, strsignal(host_sig));
++    cpu_dump_state(cpu, stderr, 0);
++#ifdef TARGET_ARM
++    /* ⚠️ У Thumb младший бит адреса — признак режима, а не часть адреса. */
++    guest_addr_bytes("LR", (unsigned long)env->regs[14] & ~1UL, 16, 6);
++    guest_addr_bytes("PC", (unsigned long)env->regs[15] & ~1UL, 0, 14);
++    guest_addr_where("PC", (unsigned long)env->regs[15]);
++    guest_addr_where("LR", (unsigned long)env->regs[14]);
++#endif
++    fflush(stderr);
++
+     preexit_cleanup(env, 128 + target_sig);
+     die_with_signal(host_sig);
+ }

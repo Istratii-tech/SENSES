@@ -1,0 +1,149 @@
+Журнал сигналов гостя «кто → кому»: строка на каждый kill, tkill, tgkill, rt_sigqueueinfo, rt_tgsigqueueinfo в файл стенда GUEST_KILL_LOG.
+
+Симптом (регресс Р-80). У одной из прошивок (5.0.2, «план») процесс systemui
+умирает каждые ~3 с тихо: демон binder видит закрытие всех его соединений
+разом, строки выхода у транслятора нет (журнал выходов GUEST_EXIT_LOG, патч
+0070, SIGKILL не видит: его исполняет ядро без нас), в журнале событий гостя
+«am_kill» нет, отказов песочницы телефона нет. Значит, сигнал послал какой-то
+процесс гостя — а КАКОЙ, не видно нигде.
+
+Причина. Все гостевые сигналы между процессами идут через транслятор (системные
+вызовы kill, tkill, tgkill, rt_sigqueueinfo, rt_tgsigqueueinfo), но он их не
+записывал.
+
+Решение. При заданной GUEST_KILL_LOG (абсолютный путь файла стенда) каждый
+такой вызов с сигналом, отличным от 0, дописывает строку
+
+  <время_мс> <pid отправителя> <tid отправителя> <имя отправителя> → <цель> [<tid цели>] сигнал <номер> = <результат>
+
+Цель — как в вызове (pid, -pgid, 0 или -1); у tgkill и rt_tgsigqueueinfo за ней
+tid цели; у tkill pid цели вызов не знает — tid идёт дважды. Номер сигнала —
+гостевой. Имя — последние до 15 знаков имени процесса (/proc/self/comm), как
+называет его журнал выходов. Результат — то, что вернул хозяин и получит гость
+(0 или -errno). Строка пишется одним write с дозаписью (O_APPEND), файл
+открывается на каждую строку — процессы гостя форки, общий описатель держать
+нельзя. Код — qemu/src/guest_kill.c; здесь только вызовы и строка в meson.build.
+
+★ Сигнал 9 САМОМУ СЕБЕ (kill в свой pid или tid, в 0, в свою группу; tkill,
+tgkill, rt_* в поток своего процесса) хозяин из вызова не вернёт — ядро снимет
+процесс внутри вызова, и строка «после» не появилась бы никогда. Такая строка
+(Process.killProcess(myPid()) — привычный конец процесса приложения) пишется ДО
+вызова, результат в ней «?». Все прочие — после вызова, с настоящим ответом.
+
+⚠️ Сигналы, которые транслятор шлёт сам себе внутри (свои служебные), сюда не
+попадают: журнал стоит на гостевых системных вызовах, а свои он посылает мимо
+них. pidfd_send_signal не пишется (у ядер прошивок 2.3–7.0 его нет).
+⚠️ Вызов, прерванный сигналом до исполнения (-QEMU_ERESTARTSYS), не пишется:
+он будет повторён и запишется при повторе. Вызов с негодным указателем siginfo
+(EFAULT у rt_*) хозяину не передаётся и не пишется.
+⚠️ GUEST_KILL_LOG — абсолютный путь: относительный после гостевого chdir указал бы
+уже не туда. Файл нельзя открыть — строки нет молча, гостю журнал не мешает.
+⚠️ Без GUEST_KILL_LOG поведение и стоимость ровно прежние: переменная читается один
+раз при старте процесса (конструктор в guest_kill.c), на каждом вызове — чтение
+одного int без вызовов (guest_kill.h). Пустое значение — как без переменной.
+⚠️ Включение в syscall.c стоит у selfmap.h, а не у guest_fwinit.h: туда же ставят свои
+строки патчи ветки fw-3a (0084). Проверено: патч ложится и на 0083 (без смещений), и
+поверх 0084–0089 (только смещения строк, без нечёткости).
+
+Проверка: tests/qemu/killlog.sh (случаи 1–13, программа tests/qemu/killprobe.c).
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -158,6 +158,7 @@
+ #include "user/safe-syscall.h"
+ #include "qemu/guest-random.h"
+ #include "qemu/selfmap.h"
++#include "guest_kill.h"
+ #include "guest_binder.h"
+ #include "guest_ids.h"
+ #include "guest_net.h"
+@@ -11235,7 +11236,15 @@
+         return get_errno(syncfs(arg1));
+ #endif
+     case TARGET_NR_kill:
+-        return get_errno(safe_kill(arg1, target_to_host_signal(arg2)));
++        {
++            GuestKill gk;
++
++            /* ★ Р-80 (патч 0090): кто кому шлёт сигнал — строка в GUEST_KILL_LOG. */
++            guest_kill_begin(&gk, GUEST_KILL_KILL, arg1, 0, arg2);
++            ret = get_errno(safe_kill(arg1, target_to_host_signal(arg2)));
++            guest_kill_end(&gk, ret);
++        }
++        return ret;
+ #ifdef TARGET_NR_rename
+     case TARGET_NR_rename:
+         {
+@@ -11875,6 +11884,7 @@
+     case TARGET_NR_rt_sigqueueinfo:
+         {
+             siginfo_t uinfo;
++            GuestKill gk;
+ 
+             p = lock_user(VERIFY_READ, arg3, sizeof(target_siginfo_t), 1);
+             if (!p) {
+@@ -11882,12 +11892,15 @@
+             }
+             target_to_host_siginfo(&uinfo, p);
+             unlock_user(p, arg3, 0);
++            guest_kill_begin(&gk, GUEST_KILL_SIGQ, arg1, 0, arg2);     /* патч 0090 */
+             ret = get_errno(sys_rt_sigqueueinfo(arg1, target_to_host_signal(arg2), &uinfo));
++            guest_kill_end(&gk, ret);
+         }
+         return ret;
+     case TARGET_NR_rt_tgsigqueueinfo:
+         {
+             siginfo_t uinfo;
++            GuestKill gk;
+ 
+             p = lock_user(VERIFY_READ, arg4, sizeof(target_siginfo_t), 1);
+             if (!p) {
+@@ -11895,7 +11908,9 @@
+             }
+             target_to_host_siginfo(&uinfo, p);
+             unlock_user(p, arg4, 0);
++            guest_kill_begin(&gk, GUEST_KILL_TGSIGQ, arg1, arg2, arg3); /* патч 0090 */
+             ret = get_errno(sys_rt_tgsigqueueinfo(arg1, arg2, target_to_host_signal(arg3), &uinfo));
++            guest_kill_end(&gk, ret);
+         }
+         return ret;
+ #ifdef TARGET_NR_sigreturn
+@@ -14627,11 +14642,25 @@
+ #endif
+ 
+     case TARGET_NR_tkill:
+-        return get_errno(safe_tkill((int)arg1, target_to_host_signal(arg2)));
++        {
++            GuestKill gk;
++
++            guest_kill_begin(&gk, GUEST_KILL_TKILL, arg1, 0, arg2);    /* патч 0090 */
++            ret = get_errno(safe_tkill((int)arg1, target_to_host_signal(arg2)));
++            guest_kill_end(&gk, ret);
++        }
++        return ret;
+ 
+     case TARGET_NR_tgkill:
+-        return get_errno(safe_tgkill((int)arg1, (int)arg2,
+-                         target_to_host_signal(arg3)));
++        {
++            GuestKill gk;
++
++            guest_kill_begin(&gk, GUEST_KILL_TGKILL, arg1, arg2, arg3); /* патч 0090 */
++            ret = get_errno(safe_tgkill((int)arg1, (int)arg2,
++                            target_to_host_signal(arg3)));
++            guest_kill_end(&gk, ret);
++        }
++        return ret;
+ 
+ #ifdef TARGET_NR_set_robust_list
+     case TARGET_NR_set_robust_list:
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -15,6 +15,7 @@
+   'guest_fwinit.c',
+   'guest_ids.c',
+   'guest_input.c',
++  'guest_kill.c',
+   'guest_net.c',
+   'guest_oom.c',
+   'guest_pagelog.c',

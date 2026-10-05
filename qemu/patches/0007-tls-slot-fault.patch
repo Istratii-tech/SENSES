@@ -1,0 +1,86 @@
+Чтение legacy-слота TLS обслуживать по факту обращения.
+
+Прошивка 2.3 собрана с ARCH_ARM_HAVE_TLS_REGISTER := false и берёт указатель
+TLS из слова 0xffff0ff0. Статически такие места правятся (tools/tls_scan.py,
+620 мест в 14 файлах), но не все: где загрузка константы и чтение по ней идут
+НЕ подряд, заменить нечего — сдвигать инструкции нельзя, на них бывают переходы.
+Осталось 60 мест: 57 в libGLES_android.so и 3 в libEGL.so. Ровно на них падал
+SurfaceFlinger — SIGSEGV по адресу 0xc (NULL+12) в libEGL.so+0x4578, найдено
+логом трансляции и картой отображений.
+
+Общее значение в слот положить нельзя: слот один на адресное пространство, а
+гостевые потоки — это настоящие потоки хозяина и идут одновременно. В
+полносистемном эталоне это лечилось патчем ядра и запретом SMP; здесь так
+нельзя.
+
+Поэтому страница помощников ядра закрывается целиком, а чтение из неё
+обслуживается в обработчике отказа доступа — он работает в том же потоке, что и
+упавшая инструкция, и отдаёт TLS именно этого потока (cp15.tpidrro_el0).
+
+⚠️ PAGE_READ снят и в учёте qemu: иначе отказ считался бы поломкой ХОЗЯИНА и
+qemu умер бы с «fatal: host SIGSEGV». PAGE_EXEC оставлен — помощники ядра
+транслятор перехватывает по адресу, до выборки инструкций.
+
+⚠️ Цена: отказ доступа плюс перетрансляция на каждое такое чтение. Для редких
+мест незаметно, для горячих точек входа GL — нет. Статическая правка остаётся
+первой линией; если графика окажется медленной именно из-за этого (сначала
+измерить), горячие места надо патчить трамплинами.
+
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -30,6 +30,7 @@
+ #include "loader.h"
+ #include "trace.h"
+ #include "signal-common.h"
++#include "guest_tls.h"
+ #include "host-signal.h"
+ #include "user/safe-syscall.h"
+ #include "tcg/tcg.h"
+@@ -673,6 +674,16 @@
+ {
+     const struct TCGCPUOps *tcg_ops = CPU_GET_CLASS(cpu)->tcg_ops;
+ 
++    /*
++     * ★ Чтение legacy-слота TLS (0xffff0ff0). Прошивка 2.3 берёт указатель TLS
++     * оттуда, а не из регистра; часть таких мест статически не правится, и на
++     * них падал SurfaceFlinger. Отдаём значение ЭТОГО потока и идём дальше —
++     * подробности в linux-user/guest_tls.c.
++     */
++    if (guest_tls_fault(cpu, addr, access_type == MMU_DATA_LOAD, ra)) {
++        cpu_loop_exit_noexc(cpu);
++    }
++
+     if (tcg_ops->record_sigsegv) {
+         tcg_ops->record_sigsegv(cpu, addr, access_type, maperr, ra);
+     }
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -487,13 +487,26 @@
+     /* Set kernel helper versions; rest of page is 0.  */
+     __put_user(5, (uint32_t *)g2h_untagged(0xffff0ffcu));
+ 
+-    if (mprotect(addr, qemu_host_page_size, PROT_READ)) {
++    /*
++     * ★ Страница закрыта НАМЕРЕННО, вместе с чтением.
++     *
++     * Прошивка 2.3 собрана без аппаратного регистра TLS и читает указатель из
++     * слова 0xffff0ff0. Положить туда общее значение нельзя: слот один на
++     * адресное пространство, а гостевых потоков много. Поэтому каждое чтение
++     * ловится как отказ доступа и обслуживается для ТОГО потока, который
++     * читает (см. linux-user/guest_tls.c).
++     *
++     * PAGE_READ снят и в учёте qemu тоже: иначе отказ считался бы поломкой
++     * ХОЗЯИНА и qemu умер бы с «fatal: host SIGSEGV». PAGE_EXEC оставлен —
++     * помощники ядра перехватываются транслятором по адресу, ещё до выборки.
++     */
++    if (mprotect(addr, qemu_host_page_size, PROT_NONE)) {
+         perror("Protecting guest commpage");
+         exit(EXIT_FAILURE);
+     }
+ 
+     page_set_flags(commpage, commpage | ~qemu_host_page_mask,
+-                   PAGE_READ | PAGE_EXEC | PAGE_VALID);
++                   PAGE_EXEC | PAGE_VALID);
+     return true;
+ }
+ 

@@ -1,0 +1,193 @@
+Вызовы, которых нет в разрешённом списке песочницы: ENOSYS вместо смерти.
+
+★★★ Продолжение 0073: там — вызовы из ЧЁРНОГО списка песочницы приложения
+Android, здесь — вызовы, которых нет в РАЗРЕШЁННОМ (SYSCALLS.TXT плюс белые
+списки AOSP bionic, libc/SECCOMP_*.TXT, теги android-8.0.0_r1 … 14.0.0_r1).
+Фильтр убивает всё, чего в разрешённом нет, тем же сигналом SIGSYS (код выхода
+159) и так же молча. Ключ тот же, что у 0073: GUEST_HOSTCALL_REAL=1.
+
+С какой версии вызов в разрешённом списке есть (по спискам AOSP; на хозяине
+старше этой версии гость, вызвавший его, умирает):
+
+  statx                      с Android 11
+  membarrier                 с 10
+  pidfd_open                 с 11
+  pidfd_send_signal, getfd   с 12
+  close_range                с 13
+  faccessat2                 нет ни в одной версии до 14 включительно
+  move_mount, open_tree      нет
+  SysV IPC (shm*, sem*, msg*), POSIX mq_*, kcmp,
+  name_to_handle_at, open_by_handle_at   нет
+
+Кто такие вызовы делает. Чаще гость нового поколения на хозяине старого:
+ART гостя 10+ может звать membarrier, библиотеки и языковые среды (Rust)
+пробуют statx и откатываются на stat, pidfd_* и close_range зовёт гость 12+.
+SysV IPC и mq в Android не нужны (общую память даёт ashmem), kcmp и вызовы с
+handle — экзотика. На хозяине, где вызов разрешён, он раньше просто работал.
+
+Что стало. Для перечисленных ГОСТЕВЫХ номеров хозяин не зовётся вовсе, гость
+получает -ENOSYS: statx, membarrier, pidfd_open, pidfd_send_signal,
+pidfd_getfd, close_range, faccessat2, move_mount, open_tree, shmget, shmat,
+shmdt, shmctl, semget, semop, semtimedop(+time64), semctl, msgget, msgsnd,
+msgrcv, msgctl, ipc (там, где у цели есть), mq_open, mq_unlink,
+mq_timedsend(+time64), mq_timedreceive(+time64), mq_notify, mq_getsetattr,
+kcmp, name_to_handle_at, open_by_handle_at. vhangup отвечает 0: сброс
+терминала гостю не нужен.
+
+⚠️ Почему ENOSYS, а не EPERM. ENOSYS — «такого вызова нет», так отвечает ядро,
+которое его не знает; библиотеки умеют откатываться на старый путь (statx →
+stat, close_range → перебор дескрипторов). EPERM читают как «нельзя по правам»
+и откатываться, как правило, не станут.
+
+⚠️ statx. Гость на хозяине 11+ раньше получал настоящий statx (со временем
+создания); теперь — ENOSYS и откат на stat. Версию хозяина транслятор не знает,
+а одинаковый ответ на всех хозяевах проверяется. Свой откат qemu (statx через
+fstatat) срабатывает только когда ENOSYS пришёл от ХОЗЯИНА, поэтому здесь он не
+подходит: stx_mask в нём остаётся нулём.
+
+⚠️ Правка касается только гостевого номера вызова: перехват стоит на входе
+do_syscall1 по номеру гостя. Собственные вызовы qemu к хозяину (загрузка ELF,
+файлы, потоки) его не проходят и не меняются — tests/qemu/hostcalls.sh гоняет
+транслятор под фильтром, убивающим и statx, и остальные номера, и проверяет,
+что транслятор под ним живёт.
+
+⚠️ На обычном Linux этого не видно: seccomp'а там нет, вызовы удаются (или
+отвечают по правам). Отсюда «стенд на Маке работал, а в APK умирал молча».
+
+GUEST_HOSTCALL_REAL=1 возвращает настоящие вызовы — для отладки там, где
+seccomp не мешает. На телефоне и в AVD включать НЕЛЬЗЯ: убьёт процесс.
+
+Проверка: tests/qemu/hostcalls.sh.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -10374,6 +10374,129 @@
+ #endif
+     void *p;
+ 
++    /*
++     * ★★★ Вызовы, которых в разрешённом списке песочницы приложения Android
++     * нет (патч 0074): хозяин их не получает, гость — ENOSYS (vhangup — 0).
++     * GUEST_HOSTCALL_REAL=1 (ключ патча 0073) возвращает настоящий вызов.
++     * Правка касается только ГОСТЕВОГО номера: собственные вызовы qemu к
++     * хозяину не затронуты. Окружение читается только у перечисленных номеров.
++     */
++    switch (num) {
++#ifdef TARGET_NR_statx
++    case TARGET_NR_statx:
++#endif
++#ifdef TARGET_NR_membarrier
++    case TARGET_NR_membarrier:
++#endif
++#ifdef TARGET_NR_pidfd_open
++    case TARGET_NR_pidfd_open:
++#endif
++#ifdef TARGET_NR_pidfd_send_signal
++    case TARGET_NR_pidfd_send_signal:
++#endif
++#ifdef TARGET_NR_pidfd_getfd
++    case TARGET_NR_pidfd_getfd:
++#endif
++#ifdef TARGET_NR_close_range
++    case TARGET_NR_close_range:
++#endif
++#ifdef TARGET_NR_faccessat2
++    case TARGET_NR_faccessat2:
++#endif
++#ifdef TARGET_NR_move_mount
++    case TARGET_NR_move_mount:
++#endif
++#ifdef TARGET_NR_open_tree
++    case TARGET_NR_open_tree:
++#endif
++#ifdef TARGET_NR_shmget
++    case TARGET_NR_shmget:
++#endif
++#ifdef TARGET_NR_shmat
++    case TARGET_NR_shmat:
++#endif
++#ifdef TARGET_NR_shmdt
++    case TARGET_NR_shmdt:
++#endif
++#ifdef TARGET_NR_shmctl
++    case TARGET_NR_shmctl:
++#endif
++#ifdef TARGET_NR_semget
++    case TARGET_NR_semget:
++#endif
++#ifdef TARGET_NR_semop
++    case TARGET_NR_semop:
++#endif
++#ifdef TARGET_NR_semtimedop
++    case TARGET_NR_semtimedop:
++#endif
++#ifdef TARGET_NR_semtimedop_time64
++    case TARGET_NR_semtimedop_time64:
++#endif
++#ifdef TARGET_NR_semctl
++    case TARGET_NR_semctl:
++#endif
++#ifdef TARGET_NR_msgget
++    case TARGET_NR_msgget:
++#endif
++#ifdef TARGET_NR_msgsnd
++    case TARGET_NR_msgsnd:
++#endif
++#ifdef TARGET_NR_msgrcv
++    case TARGET_NR_msgrcv:
++#endif
++#ifdef TARGET_NR_msgctl
++    case TARGET_NR_msgctl:
++#endif
++#ifdef TARGET_NR_ipc
++    case TARGET_NR_ipc:
++#endif
++#ifdef TARGET_NR_mq_open
++    case TARGET_NR_mq_open:
++#endif
++#ifdef TARGET_NR_mq_unlink
++    case TARGET_NR_mq_unlink:
++#endif
++#ifdef TARGET_NR_mq_timedsend
++    case TARGET_NR_mq_timedsend:
++#endif
++#ifdef TARGET_NR_mq_timedsend_time64
++    case TARGET_NR_mq_timedsend_time64:
++#endif
++#ifdef TARGET_NR_mq_timedreceive
++    case TARGET_NR_mq_timedreceive:
++#endif
++#ifdef TARGET_NR_mq_timedreceive_time64
++    case TARGET_NR_mq_timedreceive_time64:
++#endif
++#ifdef TARGET_NR_mq_notify
++    case TARGET_NR_mq_notify:
++#endif
++#ifdef TARGET_NR_mq_getsetattr
++    case TARGET_NR_mq_getsetattr:
++#endif
++#ifdef TARGET_NR_kcmp
++    case TARGET_NR_kcmp:
++#endif
++#ifdef TARGET_NR_name_to_handle_at
++    case TARGET_NR_name_to_handle_at:
++#endif
++#ifdef TARGET_NR_open_by_handle_at
++    case TARGET_NR_open_by_handle_at:
++#endif
++        if (!guest_hostcall_real()) {
++            return -TARGET_ENOSYS;
++        }
++        break;
++    case TARGET_NR_vhangup:
++        if (!guest_hostcall_real()) {
++            return 0;
++        }
++        break;
++    default:
++        break;
++    }
++
+     switch(num) {
+     case TARGET_NR_exit:
+         /* In old applications this may be used to implement _exit(2).

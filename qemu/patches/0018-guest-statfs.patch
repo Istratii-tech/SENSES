@@ -1,0 +1,55 @@
+Гостю показываем ЕГО раздел, а не диск телефона.
+
+Симптом был совсем не про диск. Приложения падали пачками с одинаковым
+стеком — NullPointerException в ActivityThread.handleReceiver:2008 и
+handleCreateService:2187. По разбору framework.jar прошивки обе строки лежат
+в блоке ОБРАБОТКИ ошибки (`mInstrumentation.onException(receiver, e)`), то есть
+настоящее исключение случилось раньше, а NPE его лишь заслонил.
+
+Причина нашлась в другом месте лога:
+
+  E installd  Couldn't openat cache: No such file or directory   (147 раз)
+  E DropBoxManagerService … at android.os.StatFs.native_restat
+  W … Low on space
+
+Гостевой /data — каталог в песочнице приложения, и statfs по нему отдаёт цифры
+всего накопителя хозяина: 471 ГБ, свободно 3,3 ГБ. Абсолютно места вдоволь, а
+по доле — 0,7 %. DeviceStorageMonitorService в 2.3 считает порог как долю от
+общего размера (ограничения сверху там ещё нет): 10 % от 471 ГБ — это 47 ГБ.
+Свободного меньше порога ⇒ «мало места» навсегда ⇒ PackageManager гоняет
+installd освобождать кэш, DropBox падает на StatFs, а приложения валятся.
+
+Отвечаем правдоподобными цифрами аппарата тех лет: 1,5 ГБ раздел, 1 ГБ
+свободно. Числа
+ЗАНИЖЕНЫ относительно реального свободного места на телефоне — значит гость не
+пообещает себе больше, чем есть.
+
+⚠️ Подменяем только ветви гостя (/data, /cache, /mnt, /system, /sdcard, /tmp);
+/proc и /dev отвечают правду.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -161,6 +161,7 @@
+ #include "guest_binder.h"
+ #include "guest_ids.h"
+ #include "guest_net.h"
++#include "guest_fs.h"
+ 
+ /*
+  * ★ Отказ в смене владельца превращаем в успех.
+@@ -10830,6 +10831,7 @@
+             return -TARGET_EFAULT;
+         }
+         ret = get_errno(statfs(path(p), &stfs));
++        guest_fs_fake(p, &stfs);
+         unlock_user(p, arg1, 0);
+     convert_statfs:
+         if (!is_error(ret)) {
+@@ -10869,6 +10871,7 @@
+             return -TARGET_EFAULT;
+         }
+         ret = get_errno(statfs(path(p), &stfs));
++        guest_fs_fake(p, &stfs);
+         unlock_user(p, arg1, 0);
+     convert_statfs64:
+         if (!is_error(ret)) {

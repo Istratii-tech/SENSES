@@ -1,0 +1,21 @@
+--- a/util/path.c
++++ b/util/path.c
+@@ -26,6 +26,18 @@
+ static const char *const guest_write_roots[] = {
+     "/data", "/cache", "/mnt", "/tmp", "/sqlite_stmt_journals",
+     /*
++     * ★ /storage — ветвь эмулированного накопителя, новинка 4.x. Зигота на
++     * каждый fork готовит там каталог пользователя
++     * (fs_prepare_dir("/storage/emulated/0")), и без права писать в эту ветвь
++     * mkdir уходит в /storage ХОЗЯИНА, которого нет:
++     *   E cutils   Failed to mkdir(/storage/emulated/0): No such file or directory
++     *   E dalvikvm cannot mountExternalStorage(): No such file or directory
++     *   E dalvikvm VM aborting
++     * — и ни один процесс приложения не выживает. У 2.3 и 4.1 каталога
++     * /storage не было вовсе, поэтому в исходном списке (патч 0004) его нет.
++     */
++    "/storage",
++    /*
+      * ★ /dev/socket — тоже наша ветвь, хотя /dev целиком к ним не отнесён.
+      * Там нет ни одного настоящего устройства: это сокеты служб, которые на
+      * живом устройстве создаёт init, а у нас — guestrun. Безусловный увод нужен

@@ -1,0 +1,115 @@
+Записи своего процесса /proc — и через task/<поток>/ и thread-self (maps, smaps, stat, auxv, cmdline, exe, список fd, oom_adj, net).
+
+Симптом (06.10, №18 и №19 — 6.0.1). Зигота и dex2oat падают в ART:
+
+  art/runtime/thread.cc:712] Check failed: &stack_variable > reinterpret_cast<void*>(tlsPtr_.stack_end)
+  (&stack_variable=0x407ffab0, …stack_end=0xea3d4000)
+
+Причина. bionic 6.0 (pthread_attr.cpp, __pthread_attr_getstack_main_thread) ищет
+стек главного потока строкой « [stack]» в /proc/self/task/<getpid()>/maps, а
+транслятор подменял карту (и всё прочее «своё»: smaps, stat, auxv, cmdline,
+exe) только по путям /proc/self/<X> и /proc/<свой pid>/<X> (is_proc_myself).
+do_guest_openat сводит путь realpath'ом в /proc/<pid>/task/<pid>/maps — такой
+путь уходил к хозяину, и гость видел карту памяти ХОЗЯИНА (чужой [stack],
+старшие биты адреса срезаны 32-битным sscanf). bionic 5.x и 7.x берут стек
+иначе — там работало.
+
+Теперь «чей путь /proc» решает одна функция, guest_proc_is_mine
+(linux-user/guest_proc.c; разбор — guest_procpath.h, без qemu): /proc/<self|
+thread-self|свой pid>/[task/<поток этого процесса>/]<X>. Принадлежность потока —
+по ядру хозяина (/proc/<pid>/task/<tid>); путь через task/<чужой поток> не
+подменяется — ядро ответит ENOENT, как ответило бы. Номер — как у ядра: цифры
+без ведущего нуля, не больше INT_MAX. Через неё же — список описателей
+(guest_proc.c, патч 0094), oom_adj (guest_oom.c) и сеть /proc/<свой>/net/…
+(guest_fs.c); чужой /proc/<pid>/task/<tid>/cmdline и …/exe — как чужой
+/proc/<pid>/cmdline и …/exe (0039, 0068): гостевой строкой, без путей стенда.
+Уже умели и не трогались: /proc/…/root|cwd (0067), attr (0086), mounts (0084).
+
+⚠️ stat через task/<tid> — тот же текст, что у процесса (open_self_stat пишет
+номер процесса, а не потока): у ядра первым полем был бы номер потока.
+⚠️ Ссылки и описатели одной карты на все потоки: у ядра так и есть.
+
+Проверка: на Маке — native/test/test_procpath.c (разбор: свои и чужие pid и tid,
+мусор, длинные числа) и native/test/test_standview.py (guest_proc_is_mine,
+guest_proc_owner_path дословно из guest_proc.c, is_proc_myself из этого патча).
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9153,28 +9153,17 @@
+     return 0;
+ }
+ 
++/*
++ * ★ Патч 0095 (Р-116): «своё» — не только /proc/self/<X> и /proc/<свой pid>/<X>, но и
++ * /proc/<свой pid>/task/<поток этого процесса>/<X> и /proc/thread-self/<X>: ядро отдаёт по
++ * ним то же самое. Путь через task/ уходил к хозяину, и bionic 6.0, ищущий стек главного
++ * потока в /proc/self/task/<getpid()>/maps, находил стек ХОЗЯИНА — ART падал («Check failed:
++ * &stack_variable > … stack_end»). Одно решение для всех подмен — guest_proc_is_mine
++ * (linux-user/guest_proc.c, разбор — guest_procpath.h).
++ */
+ static int is_proc_myself(const char *filename, const char *entry)
+ {
+-    if (!strncmp(filename, "/proc/", strlen("/proc/"))) {
+-        filename += strlen("/proc/");
+-        if (!strncmp(filename, "self/", strlen("self/"))) {
+-            filename += strlen("self/");
+-        } else if (*filename >= '1' && *filename <= '9') {
+-            char myself[80];
+-            snprintf(myself, sizeof(myself), "%d/", getpid());
+-            if (!strncmp(filename, myself, strlen(myself))) {
+-                filename += strlen(myself);
+-            } else {
+-                return 0;
+-            }
+-        } else {
+-            return 0;
+-        }
+-        if (!strcmp(filename, entry)) {
+-            return 1;
+-        }
+-    }
+-    return 0;
++    return guest_proc_is_mine(filename, entry);
+ }
+ 
+ static void excp_dump_file(FILE *logfile, CPUArchState *env,
+@@ -9337,16 +9326,13 @@
+ {
+     char host[64], buf[4096];
+     const char *tok[128], *root = NULL;
++    const char *rest;
+     long pid;
+-    char *end;
+     int fd, i, n, ntok = 0;
+     size_t rl;
+ 
+-    if (!pathname || strncmp(pathname, "/proc/", 6) != 0) {
+-        return 0;
+-    }
+-    pid = strtol(pathname + 6, &end, 10);
+-    if (end == pathname + 6 || strcmp(end, "/exe") != 0 || pid <= 0 ||
++    /* ★ 0095 (Р-116): и /proc/<pid>/task/<tid>/exe — чей путь, решает guest_proc.c. */
++    if (!guest_proc_owner_path(pathname, &pid, &rest) || strcmp(rest, "exe") != 0 ||
+         pid == (long)getpid()) {
+         return 0;
+     }
+@@ -9400,16 +9386,13 @@
+     const char *tok[128];
+     const char *root = NULL, *prog = NULL;
+     char full[1024];
++    const char *rest;
+     long pid;
+-    char *end;
+     size_t used = 0;
+     int fd, i, n, ntok = 0, first = -1;
+ 
+-    if (strncmp(pathname, "/proc/", 6) != 0) {
+-        return 0;
+-    }
+-    pid = strtol(pathname + 6, &end, 10);
+-    if (end == pathname + 6 || strcmp(end, "/cmdline") != 0 || pid <= 0) {
++    /* ★ 0095 (Р-116): и /proc/<pid>/task/<tid>/cmdline — чей путь, решает guest_proc.c. */
++    if (!guest_proc_owner_path(pathname, &pid, &rest) || strcmp(rest, "cmdline") != 0) {
+         return 0;
+     }
+     if (pid == (long)getpid()) {

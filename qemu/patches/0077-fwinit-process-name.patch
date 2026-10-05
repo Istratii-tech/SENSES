@@ -1,0 +1,57 @@
+Режим «init прошивки»: имя процесса — гостевая программа, а не «exe» (только при GUEST_FWINIT=1).
+
+Симптом. После гостевого execve (патч 0005) транслятор перезапускает САМ СЕБЯ
+через /proc/self/exe, и ядро хозяина зовёт такой процесс «exe». Журнал выходов
+(патч 0070) пишет в строке именно это имя, а ps показывает десятки одинаковых
+«exe»: стенд не может сказать, какая служба вышла или упала.
+
+Причина. Имя процесса ядро берёт из имени исполняемого файла, а исполняемый
+файл у всех процессов гостя — /proc/self/exe.
+
+Решение. При GUEST_FWINIT=1 в linux-user/main.c, перед loader_exec, процессу
+ставится имя гостевой программы (PR_SET_NAME): последние до 15 знаков её имени —
+так же Android сокращает имена своих процессов. Имя — по гостевому пути ДО
+realpath: ссылка /system/bin/ls на toolbox зовётся «ls», как у ядра. Журнал
+выходов GUEST_EXIT_LOG теперь называет службу по программе.
+
+⚠️ У сценария `#!` программа — его интерпретатор: execve уже заменил сценарий
+интерпретатором (патч 0071), и до main() доходит он.
+⚠️ Имя у потока своё (comm); потоки, порождённые гостем позже, наследуют его.
+⚠️ Без GUEST_FWINIT=1 поведение ровно прежнее (имя «exe»).
+
+Проверка: tests/qemu/fwinit.sh, случаи «4».
+
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -56,6 +56,7 @@
+ #include "user-mmap.h"
+ #include "accel/tcg/perf.h"
+ #include "guest_script.h"
++#include "guest_fwinit.h"
+ 
+ #ifdef CONFIG_SEMIHOSTING
+ #include "semihosting/semihost.h"
+@@ -892,6 +893,13 @@
+         }
+     }
+ 
++    /*
++     * ★ Режим «init прошивки» (патч 0077): гостевой путь программы запоминаем
++     * ДО realpath — ссылки дерева прошивки (/system/bin/ls → toolbox) он
++     * раскрыл бы, а стенду и ядру нужно имя, с которым программу запустили.
++     */
++    guest_fwinit_program(exec_path);
++
+     /* Resolve executable file name to full path name */
+     if (realpath(exec_path, real_exec_path)) {
+         exec_path = real_exec_path;
+@@ -1098,6 +1106,9 @@
+     task_settid(ts);
+ 
+     fd_trans_init();
++
++    /* ★ Режим «init прошивки» (патч 0077): имя процесса — гостевая программа. */
++    guest_fwinit_comm();
+ 
+     ret = loader_exec(execfd, exec_path, target_argv, target_environ, regs,
+         info, &bprm);

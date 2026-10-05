@@ -1,0 +1,66 @@
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7572,10 +7572,63 @@
+ #if (defined(TARGET_NR_stat64) || defined(TARGET_NR_lstat64) ||     \
+      defined(TARGET_NR_fstat64) || defined(TARGET_NR_fstatat64) ||  \
+      defined(TARGET_NR_newfstatat))
++/*
++ * ★ Владелец файлов дерева — «root» глазами гостя.
++ *
++ * Зачем. libc Android 4.4 перед тем, как отобразить область свойств, проверяет
++ * её владельца (bionic, map_prop_area):
++ *
++ *     if ((fd_stat.st_uid != 0) || (fd_stat.st_gid != 0) || …) { close(fd); return -1; }
++ *
++ * Дерево прошивки лежит в песочнице обычного пользователя, chown нам недоступен
++ * ни на обычном Linux, ни тем более в приложении на телефоне. Значит область свойств
++ * отвергалась молча: getprop не печатал НИЧЕГО, а libEGL, не увидев
++ * ro.kernel.qemu=1, не находил программный GLES и убивал SurfaceFlinger
++ * («couldn't find an OpenGL ES implementation»). Запасной путь через дескриптор
++ * в ANDROID_PROPERTY_WORKSPACE не спасал: та же проверка применяется и к нему.
++ *
++ * Правило. Файл, которым владеем МЫ САМИ, гость видит как root:root. Чужие
++ * файлы проходят как есть. Это ровно та ложь, которую мы и так уже говорим про
++ * личности (см. 0008-guest-identity): на настоящем устройстве образ системы
++ * принадлежит root, и прошивка вправе этого ожидать.
++ *
++ * ⚠️ Цена: различие владельцев внутри дерева пропадает. У стенда его и так нет
++ * — все файлы принадлежат одному пользователю, — но проверки вида «каталог
++ * приложения принадлежит его uid» теперь будут видеть root. Если такое
++ * всплывёт, отключается переменной GUEST_STAT_ROOT=0.
++ */
++static void guest_stat_as_root(struct stat *st)
++{
++    static uid_t me;
++    static gid_t my_gid;
++    static int state;                  /* 0 — не считано, 1 — включено, 2 — выкл. */
++
++    if (state == 0) {
++        const char *off = getenv("GUEST_STAT_ROOT");
++        if (off && off[0] == '0') {
++            state = 2;
++        } else {
++            me = getuid();
++            my_gid = getgid();
++            state = 1;
++        }
++    }
++    if (state != 1) {
++        return;
++    }
++    if (st->st_uid == me) {
++        st->st_uid = 0;
++    }
++    if (st->st_gid == my_gid) {
++        st->st_gid = 0;
++    }
++}
++
+ static inline abi_long host_to_target_stat64(CPUArchState *cpu_env,
+                                              abi_ulong target_addr,
+                                              struct stat *host_st)
+ {
++    guest_stat_as_root(host_st);
+ #if defined(TARGET_ARM) && defined(TARGET_ABI32)
+     if (cpu_env->eabi) {
+         struct target_eabi_stat64 *target_st;

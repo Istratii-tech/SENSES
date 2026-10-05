@@ -1,0 +1,76 @@
+--- a/linux-user/signal.c	2026-09-06 22:10:39.817710500 +0300
++++ b/linux-user/signal.c	2026-09-06 22:10:39.848726000 +0300
+@@ -776,6 +776,64 @@
+     return yes;
+ }
+ 
++/*
++ * ★★★ ПОХОЖЕ ЛИ СЛОВО НА АДРЕС ВОЗВРАТА, А НЕ ПРОСТО НА УКАЗАТЕЛЬ В КОД.
++ *
++ * Прежняя проверка («попадает в отображённый файл») давала слишком грязный
++ * след: в стеке полно указателей на функции, лежащих там как ДАННЫЕ. У
++ * mediaserver, например, всплывали `AwesomePlayer::onVideoEvent` и соседи —
++ * это указатели на методы, которые объект хранит в полях, а вовсе не следы
++ * вызовов. По такому следу нельзя назвать виновника.
++ *
++ * Настоящий адрес возврата отличается тем, что ПЕРЕД ним стоит команда вызова.
++ * Её и проверяем — отдельно для Thumb и для ARM:
++ *
++ *   Thumb, 32 бита:  BL/BLX  — первая половина 0xF000|…, вторая 0xC000|…
++ *   Thumb, 16 бит:   BLX Rm  — 0x4780|Rm<<3
++ *   ARM:             BL      — cond 1011 xxxx
++ *                    BLX imm — 1111 101x xxxx
++ *                    BLX Rm  — cond 0001 0010 1111 1111 1111 0011 xxxx
++ *
++ * Младший бит адреса говорит, в каком наборе команд возвращаться, — по нему и
++ * выбираем, что читать. Ложные срабатывания после этого редки: случайное число
++ * должно и попасть в код, и иметь перед собой команду вызова.
++ */
++static int guest_is_return_addr(abi_ulong w)
++{
++    abi_ulong a = w & ~(abi_ulong)1;
++
++    if (!guest_addr_is_code((unsigned long)a)) {
++        return 0;
++    }
++    if (w & 1) {
++        uint16_t h1 = 0, h2 = 0;
++
++        if (get_user_u16(h2, a - 2)) {
++            return 0;
++        }
++        if ((h2 & 0xFF80) == 0x4780) {          /* BLX Rm, 16 бит */
++            return 1;
++        }
++        if (get_user_u16(h1, a - 4)) {
++            return 0;
++        }
++        return (h1 & 0xF800) == 0xF000 && (h2 & 0xC000) == 0xC000;
++    } else {
++        uint32_t insn = 0;
++
++        if (get_user_u32(insn, a - 4)) {
++            return 0;
++        }
++        if ((insn & 0x0F000000) == 0x0B000000) {        /* BL */
++            return 1;
++        }
++        if ((insn & 0xFE000000) == 0xFA000000) {        /* BLX imm */
++            return 1;
++        }
++        return (insn & 0x0FFFFFF0) == 0x012FFF30;       /* BLX Rm */
++    }
++}
++
+ static void guest_addr_where(const char *tag, unsigned long a)
+ {
+     FILE *m = fopen("/proc/self/maps", "r");
+@@ -872,7 +930,7 @@
+             if (w < 0x1000) {
+                 continue;
+             }
+-            if (guest_addr_is_code((unsigned long)(w & ~1u))) {
++            if (guest_is_return_addr(w)) {
+                 guest_addr_where("  возврат", (unsigned long)w);
+                 shown++;
+             }

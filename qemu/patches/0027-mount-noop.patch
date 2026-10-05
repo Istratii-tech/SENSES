@@ -1,0 +1,31 @@
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9858,8 +9858,26 @@
+              * /storage/emulated/<user>. Накопитель подставляет обвязка
+              * (поддельный vold и общая папка), и это отдельная дорога.
+              */
+-            if (is_error(ret) && (ret == -TARGET_EPERM || ret == -TARGET_EACCES)) {
+-                ret = 0;
++            /*
++             * ⚠️★ ПОПРАВКА к прежнему замыслу: прощаем не только отказ по
++             * правам, а ЛЮБУЮ ошибку mount. Под qemu-user монтирование не
++             * может удаться в принципе, и дело даже не в правах: qemu передаёт
++             * ядру хозяина ГОСТЕВЫЕ пути, без подстановки корня, поэтому
++             * приходит ENOENT, а не EPERM —
++             *   E dalvikvm Failed to mount /mnt/shell/emulated to /storage/emulated:
++             *              No such file or directory
++             * Гость считает отказ смертельным (зигота убивает ребёнка), а нам
++             * монтирование и не нужно: дерево у всех процессов одно, накопитель
++             * подставляет обвязка.
++             *
++             * Отключается переменной GUEST_MOUNT_REAL=1 — тогда результат уходит
++             * гостю как есть.
++             */
++            if (is_error(ret)) {
++                const char *real = getenv("GUEST_MOUNT_REAL");
++                if (!(real && real[0] == '1')) {
++                    ret = 0;
++                }
+             }
+ 
+             if (arg1) {

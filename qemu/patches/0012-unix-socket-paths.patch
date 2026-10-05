@@ -1,0 +1,160 @@
+Пути сокетов AF_UNIX — гостевые: уводить под корень, как и все остальные.
+
+Симптом. PackageManager не может связаться с installd:
+
+  I Installer  connecting...
+  I Installer  disconnecting...
+  E Installer  connection failed
+
+Причина. qemu 8.2.2 путь сокета не переводит ВООБЩЕ: target_to_host_sockaddr
+копирует sun_path в хозяйскую структуру как есть (memcpy), без path(). Пока
+гость ходил только в binder и в кадровый буфер, это не всплывало — сокетов у
+него не было. Теперь «/dev/socket/installd» уходит к ХОЗЯЙСКОМУ /dev/socket,
+куда приложению хода нет и быть не должно.
+
+Перевод сделан не в target_to_host_sockaddr, а в do_bind и do_connect, и это
+не украшательство: буфер там заведён ровно по длине, которую прислал гость
+(alloca(addrlen+1)), а путь под корнем ДЛИННЕЕ гостевого — перевод на месте
+переписал бы стек и всё равно отдал бы bind обрезанное имя вместе со старой
+длиной. Здесь буфер берётся по размеру sockaddr_un, и длина пересчитывается.
+
+Абстрактные сокеты (sun_path[0] == 0) не трогаем: файла у них нет, имя живёт в
+отдельном пространстве имён ядра. Там сидит «jdwp-control», и увод его под
+корень ничего бы не значил.
+
+Заодно /dev/socket отнесён к ветвям, которые уводятся под корень БЕЗУСЛОВНО.
+Настоящих устройств там нет — только сокеты служб, которые на живом устройстве
+создаёт init, а у нас guestrun. Безусловность важна из-за вечного кэша решений
+path(): гость, спросивший про сокет до его появления, получил бы хозяйский путь
+навсегда.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3201,22 +3201,85 @@
+ }
+ 
+ /* do_bind() Must return target values and target errnos. */
++/*
++ * ★ Путь сокета AF_UNIX — тоже ГОСТЕВОЙ путь, и его надо увести под корень.
++ *
++ * qemu 8.2.2 этого не делает вовсе: target_to_host_sockaddr копирует sun_path
++ * в хозяйскую структуру как есть (memcpy), без всякого path(). Пока гость
++ * ходил только в binder и в кадровый буфер, это не всплывало. На Э3 всплыло
++ * сразу: PackageManager соединяется с installd по «/dev/socket/installd», и
++ * запрос уходил к ХОЗЯЙСКОМУ /dev/socket, куда приложению хода нет:
++ *
++ *   I Installer  connecting...
++ *   I Installer  disconnecting...
++ *   E Installer  connection failed
++ *
++ * Перевод нельзя делать внутри target_to_host_sockaddr: буфер там заведён
++ * ровно по длине, которую прислал гость (alloca(addrlen+1)), а путь под
++ * корнем ДЛИННЕЕ гостевого. Поэтому переводим здесь, в свой буфер, и вместе с
++ * путём меняем длину — иначе bind получил бы обрезанное имя.
++ *
++ * Абстрактные сокеты (sun_path[0] == 0) не трогаем: у них нет файла, имя живёт
++ * в отдельном пространстве имён ядра. Именно там сидит «jdwp-control», и увод
++ * его под корень ничего бы не значил.
++ */
++static socklen_t guest_unix_path(void *addr, socklen_t addrlen,
++                               struct sockaddr_un *buf)
++{
++    struct sockaddr_un *un = addr;
++    size_t maxlen = sizeof(un->sun_path);
++    size_t off = offsetof(struct sockaddr_un, sun_path);
++    char guest[sizeof(un->sun_path) + 1];
++    const char *host;
++    size_t n;
++
++    if (addrlen <= off || un->sun_family != AF_UNIX || un->sun_path[0] == '\0') {
++        return addrlen;
++    }
++    n = addrlen - off;
++    if (n > maxlen) {
++        n = maxlen;
++    }
++    memcpy(guest, un->sun_path, n);
++    guest[n] = '\0';
++    n = strlen(guest);
++
++    host = path(guest);
++    if (host == guest || strcmp(host, guest) == 0) {
++        return addrlen;                 /* под корнем такого нет — оставляем */
++    }
++    n = strlen(host);
++    if (n >= maxlen) {
++        return addrlen;                 /* не влезает — честнее оставить как есть */
++    }
++    memset(buf, 0, sizeof(*buf));
++    buf->sun_family = AF_UNIX;
++    memcpy(buf->sun_path, host, n + 1);
++    memcpy(addr, buf, off + n + 1);
++    return off + n + 1;
++}
++
+ static abi_long do_bind(int sockfd, abi_ulong target_addr,
+                         socklen_t addrlen)
+ {
+     void *addr;
+     abi_long ret;
++    struct sockaddr_un unbuf;
+ 
+     if ((int)addrlen < 0) {
+         return -TARGET_EINVAL;
+     }
+ 
+-    addr = alloca(addrlen+1);
++    /* ⚠️ Буфер по РАЗМЕРУ sockaddr_un, а не по addrlen: путь под корнем
++     * длиннее гостевого, и в тесный буфер перевод не поместился бы. */
++    addr = alloca(MAX(addrlen + 1, sizeof(struct sockaddr_un)));
+ 
+     ret = target_to_host_sockaddr(sockfd, addr, target_addr, addrlen);
+     if (ret)
+         return ret;
+ 
++    addrlen = guest_unix_path(addr, addrlen, &unbuf);
++
+     return get_errno(bind(sockfd, addr, addrlen));
+ }
+ 
+@@ -3226,17 +3289,20 @@
+ {
+     void *addr;
+     abi_long ret;
++    struct sockaddr_un unbuf;
+ 
+     if ((int)addrlen < 0) {
+         return -TARGET_EINVAL;
+     }
+ 
+-    addr = alloca(addrlen+1);
++    addr = alloca(MAX(addrlen + 1, sizeof(struct sockaddr_un)));
+ 
+     ret = target_to_host_sockaddr(sockfd, addr, target_addr, addrlen);
+     if (ret)
+         return ret;
+ 
++    addrlen = guest_unix_path(addr, addrlen, &unbuf);   /* см. do_bind выше */
++
+     return get_errno(safe_connect(sockfd, addr, addrlen));
+ }
+ 
+--- a/util/path.c
++++ b/util/path.c
+@@ -24,7 +24,15 @@
+  * то, что мы создали там сами.
+  */
+ static const char *const guest_write_roots[] = {
+-    "/data", "/cache", "/mnt", "/tmp", "/sqlite_stmt_journals", NULL
++    "/data", "/cache", "/mnt", "/tmp", "/sqlite_stmt_journals",
++    /*
++     * ★ /dev/socket — тоже наша ветвь, хотя /dev целиком к ним не отнесён.
++     * Там нет ни одного настоящего устройства: это сокеты служб, которые на
++     * живом устройстве создаёт init, а у нас — guestrun. Безусловный увод нужен
++     * потому, что решения path() кэшируются НАВСЕГДА: гость, спросивший про
++     * сокет до его появления, получил бы хозяйский путь и на второй попытке.
++     */
++    "/dev/socket", NULL
+ };
+ 
+ static bool under_guest_write_root(const char *name)

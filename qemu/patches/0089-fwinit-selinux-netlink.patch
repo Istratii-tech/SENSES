@@ -1,0 +1,60 @@
+Режим «init прошивки»: NETLINK_SELINUX — сокет, который молчит (только при GUEST_FWINIT=1 И GUEST_SELINUX=1).
+
+Симптом. Любой процесс, который у libselinux 5.0–7.0 спрашивает доступ
+(selinux_check_access: служба свойств init, servicemanager, keystore), первым
+делом проходит avc_init, а он вызывает avc_netlink_open: socket(PF_NETLINK,
+SOCK_RAW, NETLINK_SELINUX) и bind на группу SELNL_GRP_AVC (уведомления ядра о
+смене политики и режима enforce). Сокета нет — avc_init возвращает отказ и не
+взводит avc_running: у 6.0+ следующий же avc_has_perm упирается в assert(avc_running)
+и процесс гибнет; у 5.0 кэш доступа не заводится. У транслятора на этот
+протокол стоял ответ EPROTONOSUPPORT: в списке разрешённых netlink только ROUTE,
+KOBJECT_UEVENT и AUDIT.
+
+Причина. Хозяйский netlink с таким протоколом приложению не дают (политика
+SELinux хозяина запрещает netlink_selinux_socket, у виртуалки его может не быть
+вовсе), а подмена из патчей 0014 и 0021 включается только на отказ по правам.
+
+Решение. При режиме socket(PF_NETLINK, …, 7) всегда отвечает подставной сокет из
+guest_net.c — пара AF_UNIX: bind и setsockopt на нём — успех, чтение без блокировки
+— EAGAIN, с блокировкой — ждёт навсегда (уведомлений о смене политики у нас не
+бывает: она не меняется). Подмену включает errno = EACCES перед вызовом
+guest_net_socket_fallback: ни настоящий socket, ни проверка списка протоколов не
+выполняются.
+
+⚠️ Только NETLINK_SELINUX и только при GUEST_FWINIT=1 и GUEST_SELINUX=1. Без любой
+из двух переменных — EPROTONOSUPPORT, как прежде.
+⚠️ Это не «настоящий» сокет событий: selinux_status_open с запасным путём
+(fallback) читает страницу status, а не netlink — страница есть (патч 0084).
+
+Проверка: tests/qemu/selinux.sh, случаи «7».
+
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3258,6 +3258,26 @@
+     ret = target_to_host_sock_type(&type);
+     if (ret) {
+         return ret;
++    }
++
++    /*
++     * ★ SELinux «всё разрешено» (патч 0089): NETLINK_SELINUX (7) — сокет, который
++     * молчит. avc_init и selinux_status_open у libselinux открывают его на уведомления
++     * ядра о смене политики и режима; хозяин такого сокета приложению не даёт (политика
++     * SELinux хозяина, а у виртуалки может не быть протокола вовсе), а у нас политика
++     * не меняется. Всегда подставной AF_UNIX из guest_net.c (чтение блокируется или
++     * отвечает EAGAIN, bind и setsockopt — успех). Только при GUEST_FWINIT=1 и
++     * GUEST_SELINUX=1.
++     */
++    if (domain == PF_NETLINK && protocol == 7 /* NETLINK_SELINUX */ &&
++        guest_selinux()) {
++        int nfd;
++
++        errno = EACCES;     /* подмену включает отказ по правам (guest_net.c) */
++        if (guest_net_socket_fallback(domain, type, protocol, &nfd)) {
++            return sock_flags_fixup(nfd, target_type);
++        }
++        return -TARGET_EACCES;
+     }
+ 
+     if (domain == PF_NETLINK && !(

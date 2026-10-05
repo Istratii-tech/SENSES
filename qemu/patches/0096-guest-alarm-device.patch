@@ -1,0 +1,38 @@
+Устройство /dev/alarm гостя на таймерах хозяина: будильники Android и часы «с загрузки» (Р-120).
+
+Симптом (06.10, №16 — 7.1.1; та же беда на 4.2 с 23.09). `dumpsys alarm` гостя:
+«Next non-wakeup alarm: -13m6s» (просрочен), `TIME_TICK` в пачке, «Pending
+alarm batches: 9»; часы строки состояния стоят (5:44 при 5:58). В журнале
+`system` 4.x: «Failed to open alarm driver. Falling back to a handler.»
+
+Причина. Служба будильников ставит и ждёт будильники через /dev/alarm; у гостя
+устройства нет (его нет ни в одном дереве прошивки и нет у телефона), и она
+уходит в запасной путь, написанный для эмулятора без драйвера: ОДНО сообщение
+обработчику на срок ПОСЛЕДНЕГО заведённого будильника и в часах uptime. У
+будильника по настенным часам (RTC) срок — миллисекунды эпохи, то есть годы
+вперёд. На 7.x своего драйвера тоже нет: timerfd на часах *_ALARM гостю не
+даётся (нет CAP_WAKE_ALARM). Кроме того, 2.3–4.x читают через /dev/alarm и
+SystemClock.elapsedRealtime() (GET_TIME) в каждом процессе; без устройства они
+брали часы uptime без времени сна.
+
+Теперь открытие /dev/alarm перехватывает qemu (linux-user/guest_alarm.c,
+решение — guest_alarm_core.h, без qemu): ioctl по заголовку ядра Android
+android_alarm.h (CLEAR / WAIT / SET / SET_AND_WAIT / GET_TIME / SET_RTC; тип в
+битах номера), на timerfd хозяина (CLOCK_REALTIME / CLOCK_BOOTTIME /
+CLOCK_MONOTONIC, абсолютный срок), ожидание — ppoll через safe_syscall, сигнал
+гостя его прерывает. Точки входа вешает guest_binder.c (общее место перехвата
+наших устройств) — в syscall.c патч ничего не добавляет.
+
+Этот патч только вносит новый файл в сборку (список файлов meson.build — одним
+куском, как сказано в 0006; новый файл дописывается в него по алфавиту).
+
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -8,6 +8,7 @@
+ common_user_inc += include_directories('include')
+ 
+ linux_user_ss.add(files(
++  'guest_alarm.c',
+   'guest_ashmem.c',
+   'guest_binder.c',
+   'guest_fb.c',

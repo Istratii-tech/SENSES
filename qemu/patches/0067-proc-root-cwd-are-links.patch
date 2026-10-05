@@ -1,0 +1,277 @@
+Сами ссылки /proc/<процесс>/root и …/cwd: readlink отвечает целью, lstat видит ссылку.
+
+Симптом (регресс 24.09, Р-24, найдено на №3). Изнутри гостя
+`readlink /proc/self/cwd` и `readlink /proc/self/root` выходили с кодом 1
+(отказ), `ls -ld /proc/<pid>/cwd` показывал КАТАЛОГ, а не ссылку. `ls` по
+ним вёл верно — в каталог и корень гостя.
+
+Причина — в переводе из 0063. path() ведёт гостя СКВОЗЬ эти ссылки: имя
+`/proc/self/cwd` сразу становится каталогом гостя, `/proc/self/root` — его
+корнем. Вызовам, которые ссылку проходят (open, stat, chdir, opendir), это
+верно. А readlink и lstat последнюю ссылку не проходят: ядру доставался
+каталог, и оно отвечало «не ссылка» (EINVAL) и «каталог».
+
+Теперь сама ссылка, без хвоста (`/proc/<self|thread-self|число>[/task/N]/root`
+или `…/cwd`, от любого каталога-описателя), узнаётся отдельно:
+  * readlink/readlinkat отдают её цель гостевым путём: корень — «/», свой
+    каталог — из guest_cwd, чужой — обратным переводом его ссылки у ядра;
+  * lstat, lstat64, fstatat и statx с AT_SYMLINK_NOFOLLOW спрашивают ядро
+    о НАСТОЯЩЕЙ ссылке /proc (номера процессов у гостя и хозяина одни).
+Имя с хвостом (`/proc/self/cwd/`, `/proc/self/cwd/x`) идёт как прежде —
+сквозь ссылку. Горячая дорога не дорожает: последнее звено имени
+сравнивается с «root» и «cwd» до всякого выделения памяти.
+
+--- a/util/path.c
++++ b/util/path.c
+@@ -587,7 +587,144 @@
+     g_free(dir);
+     return r;
+ }
++
++/*
++ * ★ САМИ ССЫЛКИ `/proc/<процесс>[/task/<поток>]/root` и `…/cwd`, без хвоста
++ * (регресс 24.09, Р-24). path() ведёт гостя СКВОЗЬ них — в его корень и его
++ * каталог (proc_links), и вызовам, которые ссылку проходят (open, stat, chdir),
++ * это верно. А readlink и lstat последнюю ссылку не проходят: ядро ответило бы
++ * «это ссылка» и её целью, мы же отвечали «каталог» и отказом — `readlink
++ * /proc/self/cwd` выходил с кодом 1, `ls -ld` показывал каталог.
++ *
++ * Имя гостевое, от dirfd — как у path_at. 1 — это такая ссылка: *target — её
++ * цель гостевым путём (g_free), host — путь к настоящей ссылке у ядра (номера
++ * процессов у гостя и хозяина одни и те же), для lstat. 0 — не она.
++ */
++static int proc_link_at(int dirfd, const char *name, char **target,
++                        char *host, size_t cap)
++{
++    const char *last, *who, *slash, *p;
++    char *j, *a;
++    struct stat st;
++    size_t wl;
++    bool self;
++    int ok = 0;
++
++    if (!base || !name || !name[0]) {
++        return 0;
++    }
++    /* Горячая дорога (каждый lstat гостя): последнее звено — не root и не cwd. */
++    last = strrchr(name, '/');
++    last = last ? last + 1 : name;
++    if (strcmp(last, "root") != 0 && strcmp(last, "cwd") != 0) {
++        return 0;
++    }
++    if (name[0] == '/') {
++        j = g_strdup(name);
++    } else if (dirfd == AT_FDCWD) {
++        char *c = cwd_get();
+ 
++        j = g_strconcat(c, "/", name, NULL);
++        g_free(c);
++    } else {
++        char link[64], h[PATH_MAX], *dir;
++        ssize_t n;
++
++        snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
++        n = readlink(link, h, sizeof h - 1);
++        if (n <= 0) {
++            return 0;
++        }
++        h[n] = '\0';
++        dir = path_to_guest(h);
++        j = g_strconcat(dir ? dir : h, "/", name, NULL);
++        g_free(dir);
++    }
++    a = norm(j);
++    g_free(j);
++
++    if (strncmp(a, "/proc/", 6) != 0) {
++        goto out;
++    }
++    who = a + 6;
++    slash = strchr(who, '/');
++    if (!slash) {
++        goto out;
++    }
++    wl = slash - who;
++    self = (wl == 4 && !strncmp(who, "self", 4)) ||
++           (wl == 11 && !strncmp(who, "thread-self", 11));
++    if (!self && !all_digits(who, wl)) {
++        goto out;
++    }
++    if (!self && (pid_t)atoi(who) == getpid()) {
++        self = true;
++    }
++    p = slash + 1;
++    if (strncmp(p, "task/", 5) == 0) {
++        const char *q = strchr(p + 5, '/');
++
++        if (!q || !all_digits(p + 5, q - (p + 5))) {
++            goto out;
++        }
++        p = q + 1;
++    }
++    if (strcmp(p, "root") != 0 && strcmp(p, "cwd") != 0) {
++        goto out;
++    }
++    /* Процесса нет или это не ссылка — пусть ответит ядро, как ответило бы. */
++    if (strlen(a) >= cap || lstat(a, &st) != 0 || !S_ISLNK(st.st_mode)) {
++        goto out;
++    }
++    if (p[0] == 'r') {
++        *target = g_strdup("/");        /* корень у всех процессов гостя — его дерево */
++    } else if (self) {
++        *target = cwd_get();
++    } else {
++        char h[PATH_MAX];
++        ssize_t n = readlink(a, h, sizeof h - 1);
++
++        if (n <= 0) {
++            goto out;
++        }
++        h[n] = '\0';
++        *target = path_to_guest(h);
++        if (!*target) {
++            *target = g_strdup("/");    /* каталог вне дерева гостю не показываем */
++        }
++    }
++    memcpy(host, a, strlen(a) + 1);
++    ok = 1;
++out:
++    g_free(a);
++    return ok;
++}
++
++/* readlink гостя: 1 — это ссылка /proc/…/root|cwd, в *target её цель (g_free). */
++int path_proc_readlink_at(int dirfd, const char *name, char **target)
++{
++    char h[PATH_MAX];
++
++    return proc_link_at(dirfd, name, target, h, sizeof h);
++}
++
++/*
++ * Путь для вызова, который последнюю ссылку НЕ проходит (lstat, fstatat с
++ * AT_SYMLINK_NOFOLLOW): сама ссылка /proc/…/root|cwd — настоящая ссылка у ядра,
++ * остальное — как path_at. Строка живёт до следующего вызова в этом потоке.
++ */
++const char *path_nofollow_at(int dirfd, const char *name)
++{
++    static __thread char h[PATH_MAX];
++    char *t;
++
++    if (proc_link_at(dirfd, name, &t, h, sizeof h)) {
++        g_free(t);
++        return h;
++    }
++    return path_at(dirfd, name);
++}
++
+ /* chdir гостя: настоящий каталог — в дерево, гостевой — запомнить. */
+ int path_chdir(const char *name)
+ {
+--- a/include/qemu/path.h
++++ b/include/qemu/path.h
+@@ -17,5 +17,11 @@
+ ssize_t path_link_to_guest(char *buf, ssize_t len, size_t cap);
+ const char *path_link_target(const char *target);
+ char *path_to_guest(const char *host);
++/*
++ * ★ Сами ссылки /proc/<процесс>/root и …/cwd (Р-24): readlink отдаёт их цель
++ * гостевым путём, lstat видит ссылку, а не каталог, в который она ведёт.
++ */
++int path_proc_readlink_at(int dirfd, const char *pathname, char **target);
++const char *path_nofollow_at(int dirfd, const char *pathname);
+ 
+ #endif
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9464,6 +9464,7 @@
+ ssize_t do_guest_readlink(const char *pathname, char *buf, size_t bufsiz)
+ {
+     ssize_t ret;
++    char *plink;
+ 
+     if (!pathname || !buf) {
+         errno = EFAULT;
+@@ -9484,6 +9485,11 @@
+         ret = MIN(strlen(exec_path), bufsiz);
+         /* We cannot NUL terminate the string. */
+         memcpy(buf, exec_path, ret);
++    } else if (path_proc_readlink_at(AT_FDCWD, pathname, &plink)) {
++        /* ★ Сама ссылка /proc/…/root|cwd — её цель гостевым путём (Р-24). */
++        ret = MIN(strlen(plink), bufsiz);
++        memcpy(buf, plink, ret);
++        g_free(plink);
+     } else {
+         /*
+          * ★ Гостю — гостевой путь, а не хозяйский (Р-2, см. util/path.c).
+@@ -11622,6 +11628,7 @@
+     case TARGET_NR_readlinkat:
+         {
+             void *p2;
++            char *plink;
+             p  = lock_user_string(arg2);
+             p2 = lock_user(VERIFY_WRITE, arg3, arg4, 0);
+             if (!p || !p2) {
+@@ -11637,6 +11644,11 @@
+                 ret = MIN(strlen(exec_path), arg4);
+                 /* We cannot NUL terminate the string. */
+                 memcpy(p2, exec_path, ret);
++            } else if (path_proc_readlink_at(arg1, p, &plink)) {
++                /* ★ Сама ссылка /proc/…/root|cwd (Р-24, см. do_guest_readlink). */
++                ret = MIN(strlen(plink), arg4);
++                memcpy(p2, plink, ret);
++                g_free(plink);
+             } else {
+                 /* ⚠️ В свой полный буфер, а не в гостевой — см. do_guest_readlink. */
+                 char hb[PATH_MAX];
+@@ -12088,7 +12100,7 @@
+         if (!(p = lock_user_string(arg1))) {
+             return -TARGET_EFAULT;
+         }
+-        ret = get_errno(lstat(path(p), &st));
++        ret = get_errno(lstat(path_nofollow_at(AT_FDCWD, p), &st));
+         unlock_user(p, arg1, 0);
+         goto do_stat;
+ #endif
+@@ -12986,7 +12998,7 @@
+         if (!(p = lock_user_string(arg1))) {
+             return -TARGET_EFAULT;
+         }
+-        ret = get_errno(lstat(path(p), &st));
++        ret = get_errno(lstat(path_nofollow_at(AT_FDCWD, p), &st));
+         unlock_user(p, arg1, 0);
+         if (!is_error(ret))
+             ret = host_to_target_stat64(cpu_env, arg2, &st);
+@@ -13009,7 +13021,9 @@
+         if (!(p = lock_user_string(arg2))) {
+             return -TARGET_EFAULT;
+         }
+-        ret = get_errno(fstatat(arg1, path_at(arg1, p), &st, arg4));
++        ret = get_errno(fstatat(arg1, (arg4 & AT_SYMLINK_NOFOLLOW) ?
++                                path_nofollow_at(arg1, p) : path_at(arg1, p),
++                                &st, arg4));
+         unlock_user(p, arg2, 0);
+         if (!is_error(ret))
+             ret = host_to_target_stat64(cpu_env, arg3, &st);
+@@ -13034,7 +13048,9 @@
+                 struct target_statx host_stx;
+                 int mask = arg4;
+ 
+-                ret = get_errno(sys_statx(dirfd, path_at(dirfd, p), flags, mask, &host_stx));
++                ret = get_errno(sys_statx(dirfd, (flags & AT_SYMLINK_NOFOLLOW) ?
++                                          path_nofollow_at(dirfd, p) :
++                                          path_at(dirfd, p), flags, mask, &host_stx));
+                 if (!is_error(ret)) {
+                     if (host_to_target_statx(&host_stx, arg5) != 0) {
+                         unlock_user(p, arg2, 0);
+@@ -13048,7 +13064,9 @@
+                 }
+             }
+ #endif
+-            ret = get_errno(fstatat(dirfd, path_at(dirfd, p), &st, flags));
++            ret = get_errno(fstatat(dirfd, (flags & AT_SYMLINK_NOFOLLOW) ?
++                                    path_nofollow_at(dirfd, p) : path_at(dirfd, p),
++                                    &st, flags));
+             unlock_user(p, arg2, 0);
+ 
+             if (!is_error(ret)) {

@@ -1,0 +1,67 @@
+Порог mmap_min_addr определять опытом, когда /proc недоступен.
+
+Внутри песочницы приложения Android SELinux не даёт читать
+/proc/sys/vm/mmap_min_addr (домен untrusted_app_27, тип proc_security —
+denial виден в logcat). qemu откатывается на одну страницу, 4096, а настоящий
+порог ядра Android — 32768.
+
+Дальше ломается автопоиск места для гостя: pgb_find_itree начинает с
+mmap_min_addr, первая «дырка» по дереву отображений оказывается на 4096, живой
+mmap там получает отказ ядра, и по своему же комментарию («if the host addresses
+are invalid we know there are no further matches») qemu сдаётся сразу:
+
+  qemu-arm: …/system/bin/toolbox: Unable to find a guest_base to satisfy all
+  guest address mapping requirements
+    00000000-ffffffff
+
+Симптом обманчив: выглядит как нехватка адресного пространства, хотя свободных
+дырок на 4 ГБ в 39-битном пространстве приложения сколько угодно — при `-B
+0x100000000` всё запускается сразу.
+
+Порог определяем опытом: пробуем отобразить страницу по возрастающим адресам и
+берём первый, который ядро отдало именно там. Ключа MAP_FIXED_NOREPLACE не
+нужно: подсказку ниже порога ядро молча игнорирует и возвращает другой адрес.
+
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -899,13 +899,36 @@
+     }
+ 
+     /*
+-     * We prefer to not make NULL pointers accessible to QEMU.
+-     * If we're in a chroot with no /proc, fall back to 1 page.
++     * Файл прочитать не удалось: либо chroot без /proc, либо песочница
++     * Android (SELinux не даёт читать proc_security). Одна страница тут не
++     * годится — она НИЖЕ настоящего порога ядра, и поиск места для гостя
++     * упирается в отказ mmap на первой же найденной дырке.
++     *
++     * Спрашиваем ядро опытом: подсказку ниже порога оно игнорирует и отдаёт
++     * другой адрес, поэтому годен первый адрес, полученный ровно там, где
++     * просили.
+      */
+     if (mmap_min_addr == 0) {
+-        mmap_min_addr = qemu_host_page_size;
++        unsigned long probe;
++
++        for (probe = qemu_host_page_size; probe < 0x100000; probe *= 2) {
++            void *p = mmap((void *)probe, qemu_host_page_size, PROT_NONE,
++                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++            if (p != MAP_FAILED) {
++                bool got_it = (p == (void *)probe);
++                munmap(p, qemu_host_page_size);
++                if (got_it) {
++                    break;
++                }
++            }
++        }
++        /*
++         * Ни один адрес ниже мегабайта не подошёл — берём мегабайт: он выше
++         * любого разумного порога, а терять адреса нам не жалко.
++         */
++        mmap_min_addr = probe;
+         qemu_log_mask(CPU_LOG_PAGE,
+-                      "host mmap_min_addr=0x%lx (fallback)\n",
++                      "host mmap_min_addr=0x%lx (определён опытом)\n",
+                       mmap_min_addr);
+     }
+ 

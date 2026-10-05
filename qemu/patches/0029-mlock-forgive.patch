@@ -1,0 +1,76 @@
+Блокировка памяти в песочнице приложения: отказ прощаем.
+
+★★★ Зачем. Внутри APK предел заблокированной памяти (RLIMIT_MEMLOCK) —
+64 КБ, поднять его приложение не вправе. А Dalvik при старте зиготы лочит
+образ dex целиком:
+
+    W dalvikvm mlock(1858707456, 3249864) failed: Out of memory, fd=9
+
+и дальше зигота выходит (код 159), система не поднимается вовсе.
+
+На обычном Linux этого не видно: там предел 1 014 004 КБ и отказов ноль —
+потому там всё и работало. То есть различие не в AVD, а в ПЕСОЧНИЦЕ Android,
+и на живом телефоне будет ровно то же.
+
+Почему прощать безопасно. mlock — это обещание «не выгружать страницы»,
+чистая оптимизация. Гость от неудачи ничего не теряет: страницы останутся
+обычными, и вся разница — возможная подкачка, которой у нас и так нет.
+
+⚠️ Настоящий вызов мы всё-таки ДЕЛАЕМ, а не заменяем заглушкой: где
+блокировка разрешена (обычный Linux), она по-прежнему происходит.
+Прощаем только отказ по нехватке права или предела — EPERM/ENOMEM/EAGAIN.
+Остальные отказы (EINVAL на кривые аргументы) отдаём гостю как есть, чтобы не
+прятать настоящие ошибки.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7869,6 +7869,31 @@
+ }
+ #endif
+ 
++/*
++ * ★ Отказ блокировки памяти — не беда. В песочнице Android RLIMIT_MEMLOCK
++ * равен 64 КБ, а Dalvik лочит образ dex на мегабайты; без прощения зигота
++ * выходит (код 159) и система не поднимается вовсе. Блокировка — лишь
++ * обещание не выгружать страницы, и её отсутствие гостю ничем не грозит.
++ *
++ * ⚠️ Настоящий вызов всё равно ДЕЛАЕМ: где блокировка разрешена (обычный Linux,
++ * обычный Линукс), она по-прежнему происходит. Прощаем ТОЛЬКО «не
++ * разрешено» и «не хватило»: EINVAL на кривые аргументы гость должен увидеть,
++ * иначе мы спрячем настоящую ошибку.
++ */
++static abi_long guest_lock_forgive(abi_long ret, const char *what)
++{
++    if (ret == -TARGET_EPERM || ret == -TARGET_ENOMEM ||
++        ret == -TARGET_EAGAIN) {
++        static int said;
++        if (!said) {
++            said = 1;
++            fprintf(stderr, "guest: %s отказано (предел песочницы) — прощаем\n", what);
++        }
++        return 0;
++    }
++    return ret;
++}
++
+ static inline int target_to_host_msync_arg(abi_long arg)
+ {
+     return ((arg & TARGET_MS_ASYNC) ? MS_ASYNC : 0) |
+@@ -11315,7 +11340,7 @@
+ #endif
+ #ifdef TARGET_NR_mlock
+     case TARGET_NR_mlock:
+-        return get_errno(mlock(g2h(cpu, arg1), arg2));
++        return guest_lock_forgive(get_errno(mlock(g2h(cpu, arg1), arg2)), "mlock");
+ #endif
+ #ifdef TARGET_NR_munlock
+     case TARGET_NR_munlock:
+@@ -11323,7 +11348,7 @@
+ #endif
+ #ifdef TARGET_NR_mlockall
+     case TARGET_NR_mlockall:
+-        return get_errno(mlockall(target_to_host_mlockall_arg(arg1)));
++        return guest_lock_forgive(get_errno(mlockall(target_to_host_mlockall_arg(arg1))), "mlockall");
+ #endif
+ #ifdef TARGET_NR_munlockall
+     case TARGET_NR_munlockall:

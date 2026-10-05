@@ -1,0 +1,329 @@
+Все пути гостя — через path(), а не только чтение. Иначе SQLite откатывает базы.
+
+Симптом был совершенно не про пути. system_server умирал на загрузке:
+
+  E AndroidRuntime  *** FATAL EXCEPTION IN SYSTEM PROCESS: android.server.ServerThread
+  E AndroidRuntime  java.lang.IllegalArgumentException: Unknown URL content://settings/system
+
+а до того по всему логу шло «Failed to find provider info for settings», падали
+AccountManager, ContentService, BackupManager, InputMethodManagerService — и в
+самом низу этой лавины лежало вот это:
+
+  I Database  sqlite returned: error code = 17, msg = statement aborts at 13:
+              [SELECT locale FROM android_metadata] database schema has changed
+  I Database  sqlite returned: error code = 1, msg = no such table: android_metadata
+  E Database  Failed to setLocale() when constructing, closing the database
+
+То есть таблица создаётся — и тут же исчезает.
+
+Причина, найденная трассировкой:
+
+  access("/data/system/accounts.db-journal",F_OK) = 0        ← нашёл, через path()
+  unlink("/data/system/accounts.db-journal") = -1 errno=2    ← ушёл к ХОЗЯИНУ
+
+qemu переводит путь лишь у части вызовов — open, stat, access, readlink,
+statfs, utimensat, — а остальные пускает к хозяину как есть. SQLite в режиме
+DELETE фиксирует транзакцию именно УДАЛЕНИЕМ журнала. Удаление не проходит,
+журнал остаётся, и при следующем открытии SQLite видит «горячий» журнал и
+честно откатывает базу к состоянию до транзакции.
+
+Теперь через path() идут все вызовы, берущие путь: unlink/unlinkat, rmdir,
+mkdir/mkdirat, rename/renameat, link/linkat, symlink/symlinkat, chmod/fchmodat,
+chown/lchown/fchownat, mknod/mknodat, truncate, chdir, utimes и вся группа
+xattr — 31 место.
+
+⚠️ У symlink переводится ТОЛЬКО второй путь: первый — содержимое ссылки, и
+перевод записал бы в дерево гостя ХОЗЯЙСКИЙ путь.
+
+⚠️ mount/umount/swapon/swapoff/acct намеренно оставлены как есть: гостю они
+недоступны, а перевод только запутал бы разбор.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9463,7 +9463,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(link(p, p2));
++                ret = get_errno(link(path(p), path(p2)));
+             unlock_user(p2, arg2, 0);
+             unlock_user(p, arg1, 0);
+         }
+@@ -9480,7 +9480,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(linkat(arg1, p, arg3, p2, arg5));
++                ret = get_errno(linkat(arg1, path(p), arg3, path(p2), arg5));
+             unlock_user(p, arg2, 0);
+             unlock_user(p2, arg4, 0);
+         }
+@@ -9488,9 +9488,39 @@
+ #endif
+ #ifdef TARGET_NR_unlink
+     case TARGET_NR_unlink:
++        /*
++         * ★ Здесь и ниже путь ОБЯЗАН идти через path().
++         *
++         * Upstream переводит путь лишь у части вызовов (open, stat, access,
++         * readlink, statfs, utimensat), а остальные пускает к хозяину как есть.
++         * Пока гость только читал прошивку, это не всплывало. С зиготой всплыло
++         * молча и разрушительно: SQLite фиксирует транзакцию УДАЛЕНИЕМ журнала,
++         *
++         *   access("/data/system/accounts.db-journal",F_OK) = 0        ← path()
++         *   unlink("/data/system/accounts.db-journal") = -1 errno=2    ← к хозяину
++         *
++         * то есть журнал не удаляется никогда. При следующем открытии SQLite
++         * видит «горячий» журнал и ОТКАТЫВАЕТ базу. Снаружи это выглядело
++         * совершенно загадочно — таблица создаётся и тут же исчезает:
++         *
++         *   sqlite returned: error code = 17, msg = statement aborts at 13:
++         *       [SELECT locale FROM android_metadata] database schema has changed
++         *   sqlite returned: error code = 1, msg = no such table: android_metadata
++         *   E Database  Failed to setLocale() when constructing, closing the database
++         *
++         * а следом сыпалось всё, что опирается на базы: AccountManager,
++         * ContentService, провайдер настроек — и system_server умирал на
++         * «Unknown URL content://settings/system».
++         *
++         * ⚠️ У symlink переводится ТОЛЬКО второй путь: первый — это содержимое
++         * ссылки, и перевод записал бы в дерево гостя ХОЗЯЙСКИЙ путь.
++         *
++         * ⚠️ mount/umount/swapon/swapoff/acct намеренно не трогаем: гостю они
++         * недоступны, а перевод только запутал бы разбор.
++         */
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(unlink(p));
++        ret = get_errno(unlink(path(p)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -9498,7 +9528,7 @@
+     case TARGET_NR_unlinkat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(unlinkat(arg1, p, arg3));
++        ret = get_errno(unlinkat(arg1, path(p), arg3));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -9509,7 +9539,7 @@
+     case TARGET_NR_chdir:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chdir(p));
++        ret = get_errno(chdir(path(p)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #ifdef TARGET_NR_time
+@@ -9528,7 +9558,7 @@
+     case TARGET_NR_mknod:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mknod(p, arg2, arg3));
++        ret = get_errno(mknod(path(p), arg2, arg3));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -9536,7 +9566,7 @@
+     case TARGET_NR_mknodat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mknodat(arg1, p, arg3, arg4));
++        ret = get_errno(mknodat(arg1, path(p), arg3, arg4));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -9544,7 +9574,7 @@
+     case TARGET_NR_chmod:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chmod(p, arg2));
++        ret = get_errno(chmod(path(p), arg2));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -9743,7 +9773,7 @@
+             }
+             if (!(p = lock_user_string(arg1)))
+                 return -TARGET_EFAULT;
+-            ret = get_errno(utimes(p, tvp));
++            ret = get_errno(utimes(path(p), tvp));
+             unlock_user(p, arg1, 0);
+         }
+         return ret;
+@@ -9818,7 +9848,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(rename(p, p2));
++                ret = get_errno(rename(path(p), path(p2)));
+             unlock_user(p2, arg2, 0);
+             unlock_user(p, arg1, 0);
+         }
+@@ -9833,7 +9863,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(renameat(arg1, p, arg3, p2));
++                ret = get_errno(renameat(arg1, path(p), arg3, path(p2)));
+             unlock_user(p2, arg4, 0);
+             unlock_user(p, arg2, 0);
+         }
+@@ -9859,7 +9889,7 @@
+     case TARGET_NR_mkdir:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mkdir(p, arg2));
++        ret = get_errno(mkdir(path(p), arg2));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -9867,7 +9897,7 @@
+     case TARGET_NR_mkdirat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mkdirat(arg1, p, arg3));
++        ret = get_errno(mkdirat(arg1, path(p), arg3));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -9875,7 +9905,7 @@
+     case TARGET_NR_rmdir:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(rmdir(p));
++        ret = get_errno(rmdir(path(p)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10549,7 +10579,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(symlink(p, p2));
++                ret = get_errno(symlink(p, path(p2)));
+             unlock_user(p2, arg2, 0);
+             unlock_user(p, arg1, 0);
+         }
+@@ -10564,7 +10594,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(symlinkat(p, arg2, p2));
++                ret = get_errno(symlinkat(p, arg2, path(p2)));
+             unlock_user(p2, arg3, 0);
+             unlock_user(p, arg1, 0);
+         }
+@@ -10712,7 +10742,7 @@
+     case TARGET_NR_truncate:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(truncate(p, arg2));
++        ret = get_errno(truncate(path(p), arg2));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10726,7 +10756,7 @@
+     case TARGET_NR_fchmodat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(fchmodat(arg1, p, arg3, 0));
++        ret = get_errno(fchmodat(arg1, path(p), arg3, 0));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -11972,7 +12002,7 @@
+     case TARGET_NR_lchown:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(lchown(p, low2highuid(arg2), low2highgid(arg3)));
++        ret = get_errno(lchown(path(p), low2highuid(arg2), low2highgid(arg3)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12061,7 +12091,7 @@
+     case TARGET_NR_fchownat:
+         if (!(p = lock_user_string(arg2))) 
+             return -TARGET_EFAULT;
+-        ret = get_errno(fchownat(arg1, p, low2highuid(arg3),
++        ret = get_errno(fchownat(arg1, path(p), low2highuid(arg3),
+                                  low2highgid(arg4), arg5));
+         unlock_user(p, arg2, 0);
+         return ret;
+@@ -12112,7 +12142,7 @@
+     case TARGET_NR_chown:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chown(p, low2highuid(arg2), low2highgid(arg3)));
++        ret = get_errno(chown(path(p), low2highuid(arg2), low2highgid(arg3)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12129,7 +12159,7 @@
+     case TARGET_NR_lchown32:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(lchown(p, arg2, arg3));
++        ret = get_errno(lchown(path(p), arg2, arg3));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12450,7 +12480,7 @@
+     case TARGET_NR_chown32:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chown(p, arg2, arg3));
++        ret = get_errno(chown(path(p), arg2, arg3));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12655,9 +12685,9 @@
+         p = lock_user_string(arg1);
+         if (p) {
+             if (num == TARGET_NR_listxattr) {
+-                ret = get_errno(listxattr(p, b, arg3));
++                ret = get_errno(listxattr(path(p), b, arg3));
+             } else {
+-                ret = get_errno(llistxattr(p, b, arg3));
++                ret = get_errno(llistxattr(path(p), b, arg3));
+             }
+         } else {
+             ret = -TARGET_EFAULT;
+@@ -12693,9 +12723,9 @@
+             n = lock_user_string(arg2);
+             if (p && n) {
+                 if (num == TARGET_NR_setxattr) {
+-                    ret = get_errno(setxattr(p, n, v, arg4, arg5));
++                    ret = get_errno(setxattr(path(p), n, v, arg4, arg5));
+                 } else {
+-                    ret = get_errno(lsetxattr(p, n, v, arg4, arg5));
++                    ret = get_errno(lsetxattr(path(p), n, v, arg4, arg5));
+                 }
+             } else {
+                 ret = -TARGET_EFAULT;
+@@ -12738,9 +12768,9 @@
+             n = lock_user_string(arg2);
+             if (p && n) {
+                 if (num == TARGET_NR_getxattr) {
+-                    ret = get_errno(getxattr(p, n, v, arg4));
++                    ret = get_errno(getxattr(path(p), n, v, arg4));
+                 } else {
+-                    ret = get_errno(lgetxattr(p, n, v, arg4));
++                    ret = get_errno(lgetxattr(path(p), n, v, arg4));
+                 }
+             } else {
+                 ret = -TARGET_EFAULT;
+@@ -12777,9 +12807,9 @@
+             n = lock_user_string(arg2);
+             if (p && n) {
+                 if (num == TARGET_NR_removexattr) {
+-                    ret = get_errno(removexattr(p, n));
++                    ret = get_errno(removexattr(path(p), n));
+                 } else {
+-                    ret = get_errno(lremovexattr(p, n));
++                    ret = get_errno(lremovexattr(path(p), n));
+                 }
+             } else {
+                 ret = -TARGET_EFAULT;

@@ -1,0 +1,304 @@
+BUILD-MANIFEST for qemu-arm-android (libqemu.so)
+built (UTC):  2026-10-05 20:38:24
+
+QEMU version:   8.2.4
+QEMU archive:   qemu-8.2.4.tar.xz  sha256 ecf5537feab92641b99d7482f551f2195d3a5bd34acef9d52bfbff353a607397
+Alpine branch:  v3.20
+Alpine root:    alpine-minirootfs-3.20.10-aarch64.tar.gz  sha256 61ac877fdbcee6914731bc22a4ed5668ea3470f201f97a7078931c48b71bbeec
+configure:      --static --target-list=arm-linux-user --disable-system --disable-tools      --disable-docs --disable-guest-agent --disable-werror      --without-default-features --extra-cflags=-O3      --extra-ldflags=-Wl,-z,max-page-size=16384 --enable-lto
+                OPT=-O3 LTO=1
+
+compiler:       gcc (Alpine 13.2.1_git20240309) 13.2.1 20240309
+
+libraries named in NOTICE 1.3: all present in the versions given there
+
+== apk info -v (build chroot)
+agetty-2.40.1-r1
+alpine-baselayout-3.6.5-r0
+alpine-baselayout-data-3.6.5-r0
+alpine-keys-2.4-r1
+apk-tools-2.14.4-r1
+binutils-2.42-r1
+bison-3.8.2-r1
+blkid-2.40.1-r1
+brotli-libs-1.1.0-r2
+bsd-compat-headers-0.7.2-r6
+build-base-0.5-r3
+busybox-1.36.1-r31
+busybox-binsh-1.36.1-r31
+bzip2-dev-1.0.8-r6
+c-ares-1.33.1-r0
+ca-certificates-20260413-r0
+ca-certificates-bundle-20260413-r0
+cfdisk-2.40.1-r1
+curl-8.14.1-r2
+dmesg-2.40.1-r1
+docbook-xml-4.5-r9
+docbook-xsl-1.79.2-r9
+file-5.45-r1
+findmnt-2.40.1-r1
+flex-2.6.4-r6
+flock-2.40.1-r1
+fortify-headers-1.1-r3
+fstrim-2.40.1-r1
+g++-13.2.1_git20240309-r1
+gcc-13.2.1_git20240309-r1
+gdbm-1.23-r1
+gettext-0.22.5-r0
+gettext-asprintf-0.22.5-r0
+gettext-dev-0.22.5-r0
+gettext-envsubst-0.22.5-r0
+gettext-libs-0.22.5-r0
+gettext-static-0.22.5-r0
+glib-2.80.5-r0
+glib-dev-2.80.5-r0
+glib-static-2.80.5-r0
+gmp-6.3.0-r1
+hexdump-2.40.1-r1
+isl26-0.26-r1
+jansson-2.14-r4
+libacl-2.3.2-r0
+libatomic-13.2.1_git20240309-r1
+libblkid-2.40.1-r1
+libbz2-1.0.8-r6
+libcap-ng-0.8.5-r0
+libcrypto3-3.3.7-r0
+libcurl-8.14.1-r2
+libeconf-0.6.3-r0
+libedit-20240517.3.1-r0
+libedit-dev-20240517.3.1-r0
+libexpat-2.8.1-r0
+libfdisk-2.40.1-r1
+libffi-3.4.6-r0
+libffi-dev-3.4.6-r0
+libformw-6.4_p20240420-r2
+libgcc-13.2.1_git20240309-r1
+libgcrypt-1.10.3-r0
+libgomp-13.2.1_git20240309-r1
+libgpg-error-1.49-r0
+libidn2-2.3.7-r0
+libintl-0.22.5-r0
+libmagic-5.45-r1
+libmenuw-6.4_p20240420-r2
+libmount-2.40.1-r1
+libncurses++-6.4_p20240420-r2
+libncursesw-6.4_p20240420-r2
+libpanelw-6.4_p20240420-r2
+libpcre2-16-10.43-r0
+libpcre2-32-10.43-r0
+libpsl-0.21.5-r1
+libsmartcols-2.40.1-r1
+libssl3-3.3.7-r0
+libstdc++-13.2.1_git20240309-r1
+libstdc++-dev-13.2.1_git20240309-r1
+libunistring-1.2-r0
+libuuid-2.40.1-r1
+libxml2-2.12.10-r0
+libxml2-utils-2.12.10-r0
+libxslt-1.1.39-r2
+linux-headers-6.6-r0
+linux-pam-1.6.0-r0
+logger-2.40.1-r1
+losetup-2.40.1-r1
+lsblk-2.40.1-r1
+m4-1.4.19-r3
+make-4.4.1-r2
+mcookie-2.40.1-r1
+meson-1.4.0-r2
+meson-pyc-1.4.0-r2
+mount-2.40.1-r1
+mpc1-1.3.1-r1
+mpdecimal-4.0.0-r0
+mpfr4-4.2.1-r0
+musl-1.2.5-r3
+musl-dev-1.2.5-r3
+musl-utils-1.2.5-r3
+ncurses-dev-6.4_p20240420-r2
+ncurses-terminfo-base-6.4_p20240420-r2
+nghttp2-libs-1.62.1-r0
+partx-2.40.1-r1
+patch-2.7.6-r10
+pcre2-10.43-r0
+pcre2-dev-10.43-r0
+pkgconf-2.2.0-r0
+py3-distlib-0.3.8-r1
+py3-distlib-pyc-0.3.8-r1
+py3-packaging-24.0-r1
+py3-packaging-pyc-24.0-r1
+py3-parsing-3.1.2-r1
+py3-parsing-pyc-3.1.2-r1
+py3-pip-24.0-r2
+py3-pip-pyc-24.0-r2
+py3-setuptools-70.3.0-r0
+py3-setuptools-pyc-70.3.0-r0
+pyc-3.12.13-r0
+python3-3.12.13-r0
+python3-pyc-3.12.13-r0
+python3-pycache-pyc0-3.12.13-r0
+readline-8.2.10-r0
+runuser-2.40.1-r1
+samurai-1.2-r5
+scanelf-1.3.7-r2
+setarch-2.40.1-r1
+setpriv-2.40.1-r1
+sfdisk-2.40.1-r1
+skalibs-2.14.1.1-r0
+sqlite-3.45.3-r3
+sqlite-dev-3.45.3-r3
+sqlite-libs-3.45.3-r3
+ssl_client-1.36.1-r31
+tar-1.35-r2
+umount-2.40.1-r1
+util-linux-2.40.1-r1
+util-linux-dev-2.40.1-r1
+util-linux-misc-2.40.1-r1
+utmps-libs-0.1.2.2-r1
+uuidgen-2.40.1-r1
+wipefs-2.40.1-r1
+xz-5.8.3-r0
+xz-libs-5.8.3-r0
+zlib-1.3.2-r0
+zlib-dev-1.3.2-r0
+zlib-static-1.3.2-r0
+zstd-libs-1.5.6-r0
+
+== patches: 94 (applied in this order), sha256
+ff1eef4860322f87ce550a291e5a60c8baf08445f4ea67aeeab43b815d7a6b64  0001-skip-zero-sized-pt-load.patch
+92d6042923e425d56340c3ae28950290ea3304f26e53180d3cf3820f758be153  0002-musl-flock64.patch
+00e11b406ab21acc73e08bb8b48e5059d78d30226db09a12e5021b3799a09af8  0003-probe-mmap-min-addr.patch
+6dbec146c255532fb5aa2808ed5d89a134918ac199a5410d195533e1d209af64  0004-writable-sysroot.patch
+cdf275dc6f6a6d8436c1ffc97a8b98d6caa140408e3e66875e2df900db4f49fa  0005-execve-reenter.patch
+2858921745771661dbdf1e0c12a2ef801f421d83cd44c26b24176914fdda2245  0006-guest-binder.patch
+96f9f173f69667c9796017c05595d38405935b3f021ed47d4ef5c07492dec2ff  0007-tls-slot-fault.patch
+4983db801793ca3fc8a4919853fae9e55dcd9bb2971bae15a96a3eb729170fb9  0008-guest-identity.patch
+44afe1c62f26a2be97c25fecf16ab3fd79f435ad74c9107246bee6875c29c610  0009-cacheflush-retval.patch
+87be80c5077f4580189f79ed694a82ac5783265fb4bcfc29433c57c36ebc7a11  0010-guest-credentials.patch
+0e5f16381615da08b45df1e50170f855ca03a22384d488dd4ec0df295533b941  0011-guest-log-append.patch
+b17ff01f0450b3e2d1ebc10c158bc658f05b854713dcfac42f9113e1e3378944  0012-unix-socket-paths.patch
+e9fbed45f2543a0ca86f0a27c910a22aa5bb029c1e0495491006b3ef11e4ac86  0013-musl-msghdr-padding.patch
+360a09deca080c31bbfe679fc47ed2f71f7bdbdc2ccf8e1668e3cab3095698e5  0014-netlink-fallback.patch
+24f7e28a1259fcd93493f9a4059d5333d713a34e48e25a62069932f52213fb21  0015-guest-paths-everywhere.patch
+ab5ebf9f59790cc443826056bff94e49ce9affaefa113f14ce91723e886e43fc  0016-chown-forgive.patch
+9dd68c84a659901abdedb3eddf6666d713f3d1950387359eae44e7f92d4f6080  0017-peercred-guest.patch
+dd97a19e6a2a1dba7969a1081f9f0f111b3d000870b312c8cf1677e278252f26  0018-guest-statfs.patch
+dc528f98e333128e9f7957eed1368f06792b70b33a92ca0de0e8574f8b278426  0019-sockbufforce-fallback.patch
+8a088eea0d45632f04c16b4ebd42b2a338e3dec2a660e445451851ec518d3f1b  0020-guest-threads-only.patch
+2e1e624ebed6b9aed0eb2cd1b24a5144252a108af07d051a8fb3db531594776e  0021-netlink-bind-fallback.patch
+f3c87fc247b5b1a09d7035041667ad837ed5245789e1418accd08ce977d6b3ba  0022-stat-owner-root.patch
+3e80fc7ae9e2c542b4e37071c45051f3eb7deef78678d8aac081de72b1a378b0  0023-setpriority-forgive.patch
+6e23cd9225d42b22bf06968f94999277ff09c3ea0b835b8bf478ae75b5e4e48f  0024-unshare-mount-forgive.patch
+f8c9d20ed8cbd3e8550877ebdae2a7e7de3cba8d2643054cbf33ad409d928da8  0025-owner-keeps-access.patch
+804021d4c30afb2ae1b0e8edfc56348f1c317e7b2391efb8427afb9229fc5e66  0026-storage-writable.patch
+ea7f9c43ecbef8c8df595dd340d9459b4b328a4ec0738967231d2354d9ab913a  0027-mount-noop.patch
+9f79d2dc750bf31f881b6081e298ae91c04b98597e133cc25106aebd67746fe9  0028-owner-map.patch
+1e28a261ffdb0c5eaf9a8427989c63b319f5029c314bd88d79a6cb05315414e9  0029-mlock-forgive.patch
+2aa12f6fde371da0cb0de912f87a374d9160b901ddb8259299338b8275e6b6d4  0030-mount-never-syscall.patch
+4b2147f77a2b15ba2bd87866993d16230905ad62956c6f946b53d3204d3147b7  0031-hide-host-paths.patch
+8dff49b080ceeaa0ffca0a04b418ac05095dae4cc1820f7c6235b45d45bd91d0  0032-fork-clone-lock.patch
+fb9de8c5660c61e72d1d7d0f2570b31db8b88668e0d3d5555fff4d98882589eb  0033-smc-write-fault-on-old-kernels.patch
+c78f9c2cbfe81d59f0ae6356a4e9532185f94baac8f114ba229ab390be5a5833  0034-smc-write-maperr-kernel49.patch
+3a668f5eaccdecb855cf4925f4e6a67583cd7effe20591398f47685e0a551d6f  0035-guest-crash-report.patch
+9010c4620d499af217a5df6c4792f398c9924a311ed9ce4434b85f763b2678ba  0036-bigger-tb-jump-cache.patch
+f2f198eb4a8a866dbe5c654d04cf17a9bfaad8b130dc751c5a08ca54d8716f4d  0037-guest-stack-trace.patch
+bf1e411e5d0024068ecafa4aa66858bff8a7ae38f78e8066295ceca26106c029  0038-return-addr-filter.patch
+2e2ab70f04c191203d27479539e427e1508739b489a19978f747509734bbbaf8  0039-guest-cmdline-of-others.patch
+69099ad959afec9127bcd9a150725ec38a7a6c9b2f2c9bbc586515dcb1c8526d  0040-created-dir-owner.patch
+ba818c926272af00340fde5e09b70782b70164419d02c7463e1dd68857d2fb8e  0041-sdcard-no-escape.patch
+51a45eeb7868c3e2f6609e661a8d791f0dfc2f07337e954d467ccd5277282c65  0042-http-to-proxy.patch
+a443b7ae39a2275c5704ea5318a9bfb9c88fb4c747b8101912df8a645fc5041c  0043-dns-sendto-to-proxy.patch
+7d3817379ce7664afb18dbae39a9a4380b802d097f9f7cf7e4a299786f8a2c4e  0044-netlink-answer-dumps.patch
+77a3e1f54a5fcd9adca19b686bb861b17a747acecd387e24e82ec0e31834eee8  0045-dns-answer-from-right-server.patch
+c7b93e5db6f516c2c9233b93768bc1e0fb8aef7dcc075a3729f83b91e375882f  0046-mprotect-failure-visible.patch
+2b7b2265aaa1e2fa739d12efc68409507d092183475cf54434b357013d307da3  0047-madvise-dontneed-invalidates-code.patch
+3c2a29bf563eff391c7298b5ac9be920aafd4f51e43991eb70984cb1cd71d984  0048-page-exec-watch.patch
+c3dd47626fe674ad7e47b97f7b9448b7da2f1368f7e1a26ec3b1059453a1f74c  0049-where-did-the-jump-come-from.patch
+84f0c46a673324aed420ead6e73139758c07ab3dc5a24502e7ed3d5c9587fd2f  0050-catch-the-bad-word.patch
+4495064f54397e6bf73f32a576128c2e1deaee4e945f9f9679de0885eee36f6a  0051-no-write-trap-flush-on-request.patch
+00ad36eb0007735dd687bac8e3f9d48b77009ca20f4cd747921c941ad55755c7  0052-who-writes-that-word.patch
+4b9d39b9667e90ed43589242d1d9ba8a60b2e35a151fd7e1ad60d4ba31b18a84  0054-optional-no-tcg-optimizer.patch
+068f1aae190477901456f5b0262c24799da8787029d9764dd350e18d7ef3b623  0055-guest-cpu-count.patch
+40897855b192500f1699313b5c2f393d00e5a79a82d6866934ce925763b8f8d8  0056-arm-sigsuspend-mask-by-value.patch
+c97a9dc9ead778b96ee4a623a39541b708872ab0729d20dacf88f167acdef58a  0057-netlink-looks-like-the-kernel.patch
+fbe558d72bf16a09d362b9354a211cf9791263258d77266a42bad59440d10297  0058-setsockopt-so-mark.patch
+393d3c4adfc825c64bef0a9997ebd86af79b28b9c8aadf426d9a8aa8ba43a915  0059-hide-host-sys.patch
+5b8942a3efd554c75778bd69ed1c0b95ef35434e78ecace1918bf6592bdfc12f  0060-stand-env-not-for-guest.patch
+9212ff13274e150a941971278cbd129096526b5f31cd29a433d4ccc810b1781e  0061-uname-not-the-host.patch
+78f3ca9270d437911d07e719069fe4f77bff10815dd1c09f3f81f667ba135d77  0062-guest-trace.patch
+859e33d441ec1e3c635c015295333349cbcebc1beff8617f318c2641702e6794  0063-guest-stays-in-its-tree.patch
+0c61828851b225520b509e56b7ff12b6b40773eb57bd0a25adbbd60540d51a3a  0064-installd-dexopt-queue.patch
+4ab18e4f734379c3b308f8102b5e41ccd42a90a267599c7e713db447cd7a1747  0065-readlink-full-host-buffer.patch
+3490cee489f815346ed109c0a01b75a365d9c9353c478b4b1f5a1dca89a13157  0066-oom-adj-write-succeeds.patch
+6f26975f53c8e8055805848cea169a61d605bc9f5ffdb921158442a88d257418  0067-proc-root-cwd-are-links.patch
+4f1fc833f43b7f37c3a5d1a8e65242695d3c3311857760eeaea620f4e1cd1399  0068-proc-links-not-into-stand.patch
+58bcd16c96e66d729bfaa0b914650a31054b9b36fbf3c0f0e66571541f5554e3  0069-no-qtaguid-for-guest.patch
+c95d16d2d792a86260095bbc3764026d649fc42d0a633adab935684d5894a256  0070-guest-exit-code-log.patch
+a0c74ec52a8c5077ce3b5289043bb8c6c9785ca7a432737f59106905624ba17f  0071-execve-script-interpreter.patch
+7742122ce0f2c341bf5318a1f9c3e05c77498df8ccf38ee77eac8e8fbc5f4680  0072-umount-never-syscall.patch
+8b3b249a679505e4cce0d3cb088712cc8eb944939b9435dcd5fd98f897442759  0073-dangerous-host-calls.patch
+63b3a8d3974a3b166f3a500319e0f357f7571f388f25c25e7580ef68bea63d8d  0074-enosys-not-death.patch
+be4d81b0c2e610c95a729947dfb0b10778b9fedd7912047300dcacc7b1afbe62  0075-fwinit-dev-is-the-tree.patch
+db71e832ca6a9f8ab423089b1e0584996460b9858c9134dae2040c3a6c1e38df  0076-fwinit-mknod-stub.patch
+b3325e9f9c7de4cc8bd96433ef943978b3e2b1f8d1b6dbc4fa008a1f86b4c204  0077-fwinit-process-name.patch
+5010edabd00bcad0ca62ee7161765b825a9f604d99c1135003d52f425b0085b0  0078-fwinit-start-log.patch
+72924e805840fd68faf18f8867d027953b334dac1d81372c9ccb2c9bc9d6890c  0079-fwinit-identity-survives-execve.patch
+4d75c589e6d73effdba7ea8ce170796565e5dc83d1fb240d417e8053fb16277e  0080-fwinit-property-log.patch
+5cea6171130760b36fa5f7ecc6665f2bdac3334c9681aab73621e99b331eafd9  0081-fwinit-reboot-log.patch
+d6f23e1e959d1df9b6fc1a92e92411317fb395d16bfd97c707924f72546f094e  0082-fwinit-kmsg-append.patch
+176df92f774043c59bc848486c924f2370315fd77d9c6d8fedfdbe881c88af17  0083-fwinit-keep-properties-name.patch
+153f68f979cd0072c848cda0fcefe14a73bab3140c2fb9fd84f518629c84ecec  0084-fwinit-selinuxfs.patch
+9ac37b5b30ad6013dc4197ca81bd1ecdf31f7d856a4183302dd8618408eb3e52  0085-fwinit-selinux-transactions.patch
+f71ba234089aee501d2c1b92870b8559d466f561077c9c0a94624d578c7d0b1f  0086-fwinit-selinux-proc-attr.patch
+faf4ee972e0bf8addb5a2cc8dc991dc08a781d9f857b386732511880870a6157  0087-fwinit-selinux-xattr.patch
+7f5ebc11adfc2f02f84ffb93348830d937fee7042979bdc89d85df6b61106425  0088-fwinit-selinux-peersec.patch
+d7f19fdf1628c5e5d00f48912a3442ba89ba582dd6790b6b7024fc029933891f  0089-fwinit-selinux-netlink.patch
+a347159325e6dcc757e23b0836f735ec12c8c7cd37cf8c3b7df6ca5ab7079930  0090-guest-kill-log.patch
+c6b4ec78824c151bb61ce3520be291775c22d267bd407cd5b59d59ac846eed33  0091-arm-sigreturn-thumb-pc.patch
+95e3f7c779034cb7511485acdb6b7e4c6fddaf531c92c3650ef1ab4ba7388bab  0093-unix-socket-name-guest-path.patch
+7e59c3af45b0d9d682bb421721570588b1dae5464c27faf4c74d2caf82c3a4c5  0094-stand-fds-hidden-from-guest.patch
+b38316905ff72ef6713d3c8a3882488de3bf0e7a341c12fc42f355520aab31d5  0095-proc-task-paths-are-own.patch
+a67f4fdde8bb84f738299bdc35ab8e86c10114d96d56f67607a1e9e7e1964a2d  0096-guest-alarm-device.patch
+
+== our source files copied into linux-user/: 39, sha256
+ed929a7896b3f2c97476257a586082d33443e1c78dd11e839fb5da31b74568fc  binder_proto.h
+1521c83fe9484ae011afe3a8aae51849783485291a1cc31f8c4cf793af5f8056  guest_alarm.c
+4383d2d77fdb2625fc23c32739dd271a29a276fef0b9287dfbd124178f45cbff  guest_alarm.h
+3234e6ebfddf53e092323c90c2b501e21acb59ac572e14cb0acecea6f14c835c  guest_alarm_core.h
+7c4c42b13bff7a26d1f20447ffbf456419857fcc5f4416975393b3df6e969147  guest_ashmem.c
+451853d0202981b875957f7e7816de5b710504afe8029fb3563e7ff614dcfca7  guest_ashmem.h
+f9da48767518ab47f3c9c81e60acad352c103f71cfd07b600a3cc36fd2a508b7  guest_binder.c
+45bef6276bef7f83ff1536a7174174002d3d9ba509396fa8d43bacba9f6df340  guest_binder.h
+140daeb696e19ee46231e8c33921375bb24e19efed157b1fba02d348623859e4  guest_fb.c
+3c24f761a0306baf33c54a7515742bc1ffc1c4f2d71a314ed360c7e92fc08a4a  guest_fb.h
+ed1bbcc5d64366d4d6e9441be654452258ef2d4579d83dc1b60b2a824ee1676f  guest_fs.c
+b7d55bf45be930bafa7a182bfc03358276db11b6e64a9a38ae314b6437c028b6  guest_fs.h
+5d22f1025e517ef071fc4f463597792c92aa6f9c70cd4185123464b8c390a9da  guest_fwinit.c
+889990fedfef178852f1dc35535f8b36a7db9aeb7852b7e09e926cbe34c5d39c  guest_fwinit.h
+d28144ff5188a0e0d951ccc629eea37a8ca26327a21c1c12ec06e354f7afb120  guest_ids.c
+969909142cec3268a2967bda6a549ea6ea9587659497e2396750a7d8654d1e5e  guest_ids.h
+22af3ff664d09cb29ec65744a9c85f273e2f9d3e364d0cdf59a30eb32c43583a  guest_input.c
+1e5832184ffe413df0c3401eed3c7601305535587506dc558b6a61365ed38770  guest_input.h
+eab982964dc8ee14f0ecaecef5b789f690d865cf1d42f2736ee555ef49f1ae1e  guest_input_pump.h
+ffa51e47c9c19e86aae07e5fd99f104ef00719ee1be07b897b6294e97295832a  guest_kill.c
+9581eebc6632fa69ad3bc8f02d11634841befdaf4c3ed021c2a8fb549c6c3f04  guest_kill.h
+045596a476d5d77b535a65f8ed8c0e78dc5106e06a30b7d900f1540f464a3971  guest_net.c
+8731c403af5badd8d187dd81264ae56ce8946cbb7f7f6e18b3022f293bfbd23b  guest_net.h
+66abb6988a3c7584d252234216592b1b8f2e945bad41792a360a0ed1e5438984  guest_oom.c
+240e9f6ba80060ff4b301e2bd65c92d95ff15290fd77f39a3591d3d58b0258b1  guest_oom.h
+279b54eca69d5636a3b435c9c8bf840f47a4feb051195339a25b8b739aee332e  guest_pagelog.c
+28ef170aed0252300995258238681812c128bfe1dfb80c795dd8cfe3383ef81e  guest_pagelog.h
+ef823ec923d73f8af1eb8e6faeb1217d85d4de2859e9c0110c5a9743d521b13a  guest_proc.c
+7e8b7631a0b7b2eae6478bfc39ab9f79a322dbd83d2f2332ab596a866dfb4a9f  guest_proc.h
+9cf9fb280bffdaf348c45a565ed83fa96d3b059c868f23335fc2bfa783043df2  guest_procpath.h
+6144b84edc5ba1825e21fa81102203bdd0535a7353cc45da8c6d693f11878ad3  guest_script.c
+51b61d7c1644971e5c9dea4fcfe215c6024cc05120f97c5fb4cda4c5e0d7780b  guest_script.h
+2be98a215e32a7d9f472407c5ecc3feb0e08b54bc8e87fbd35f35c5d50c66a14  guest_selinux.c
+aaba00c6d25926ee6ab6c1505422f2048e93df098e0403b3d5b3076607a860a1  guest_selinux.h
+8edfd7a1bfc5b854a3e9235b5794992ec70fb5488c0b97f819d51908c2ae44f4  guest_tls.c
+06bdfda59c54ae081ed3dc656e9827d60d160301d369328835c5c00f0221deee  guest_tls.h
+9847d594a9fff860c4f9f6e052d78fb1b6222db9b1aa28f478e5dcf869d0de43  guest_trace.c
+5526987e32685da574196e5457bf8d5ddf4ef71ad5aeee5a6bef750789cc261f  guest_trace.h
+13b914fa330a96c3afaf1842277577f22a6fe1084c9ea0ade2f59cf53aecd092  guest_xattr.h
+
+== result, sha256
+637212179289e5ad67aac6157c7c2c4e6d8e0ab2fdf9304b5862ccc3e20d0031  qemu-arm
+f3284da175d61c57b670d159a57202fcee2750f6a1ea55fdfd8c5e52185ae139  qemu-arm-dbg

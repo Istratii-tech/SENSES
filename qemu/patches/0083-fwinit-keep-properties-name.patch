@@ -1,0 +1,58 @@
+Режим «init прошивки»: unlink и unlinkat имени /dev/__properties__ — успех без удаления (только при GUEST_FWINIT=1).
+
+Симптом. init 4.2–4.3 создаёт область свойств файлом /dev/__properties__ и сразу
+удаляет имя: файл живёт, пока открыт описатель. Помощникам стенда эта область
+нужна ПО ПУТИ (читать свойства, которые init пишет в неё сам), а по
+удалённому имени её не найти.
+
+Причина. Гостевой unlink идёт хозяину как есть (под /dev гостя — дерево, патч
+0075), и имя пропадает из каталога dev.
+
+Решение. При GUEST_FWINIT=1 unlink и unlinkat РОВНО гостевого пути
+/dev/__properties__ отвечают 0 и ничего не удаляют: файл остаётся в каталоге dev
+дерева. Проверка — qemu/src/guest_fwinit.c (guest_fwinit_keep), дословное
+сравнение гостевой строки до перевода пути.
+
+⚠️ Сверка дословная: «/dev//__properties__», «/dev/./__properties__» и прочие
+написания — другие строки и удаляются как обычно. Относительный путь (unlinkat с
+dirfd) не проверяется: init зовёт по абсолютному. unlinkat с AT_REMOVEDIR — это
+rmdir, его не касаемся.
+⚠️ Ответ 0 даётся и когда файла нет: вызов о файле ничего не знает.
+⚠️ Без GUEST_FWINIT=1 поведение ровно прежнее.
+
+Проверка: tests/qemu/fwinit.sh, случаи «9».
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -10832,7 +10832,16 @@
+          */
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(unlink(path(p)));
++        /*
++         * ★ Режим «init прошивки» (патч 0083): имя /dev/__properties__ не
++         * удаляется — init 4.2–4.3 создаёт область свойств файлом и сразу
++         * удаляет имя, а помощникам стенда нужна область по пути.
++         */
++        if (guest_fwinit_keep(p)) {
++            ret = 0;
++        } else {
++            ret = get_errno(unlink(path(p)));
++        }
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10840,7 +10849,12 @@
+     case TARGET_NR_unlinkat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(unlinkat(arg1, path_at(arg1, p), arg3));
++        /* ★ То же для unlinkat без AT_REMOVEDIR (патч 0083). */
++        if (!(arg3 & AT_REMOVEDIR) && guest_fwinit_keep(p)) {
++            ret = 0;
++        } else {
++            ret = get_errno(unlinkat(arg1, path_at(arg1, p), arg3));
++        }
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif

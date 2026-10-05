@@ -1,0 +1,191 @@
+Режим «init прошивки»: selinuxfs «всё разрешено» — каталог транслятора на гостевом пути /sys/fs/selinux (только при GUEST_FWINIT=1 И GUEST_SELINUX=1).
+
+Симптом. Настоящий /init Android 5.0+ без SELinux не идёт: он монтирует selinuxfs
+и пишет в неё политику, а не получив — «SELinux: Failed to load policy; rebooting
+into recovery mode» и перезагрузка. С файлами selinuxfs, лежащими в дереве
+(проба шага 0), политика «грузилась» — но тогда у 2.3–4.4 в дереве была бы точка,
+по которой libselinux решает «SELinux включён», а стенду пришлось бы раскладывать
+файлы самому.
+
+Причина. У транслятора нет ядра: statfs точки /sys/fs/selinux не отвечает
+SELINUX_MAGIC, в /proc/filesystems и /proc/<pid>/mounts нет selinuxfs, самих
+файлов нет. libselinux (init.c, enabled.c, stringrep.c) ищет точку по statfs
+(запасной путь — по этим двум файлам), читает enforce, policyvers, deny_unknown,
+status, словарь class/<класс>/index и perms/<право>.
+
+Решение. Новая переменная стенда GUEST_SELINUX=1 (для поколения ≥ 21) вместе с
+GUEST_FWINIT=1 включает всё ниже; без любой из двух поведение ровно прежнее.
+  * util/path.c: гостевой путь /sys/fs/selinux уводится в НАСТОЯЩИЙ каталог
+    <корень>/dev/.selinuxfs — не в sys/fs/selinux дерева. Все вызовы файловой
+    системы (stat, access, open, mmap, opendir, getdents) работают над ним
+    как над каталогом, перехватов на каждый нет. /dev гостя — его tmpfs: стенд
+    очищает его перед «Пуском», и состояние (enforce) живёт до следующей загрузки.
+  * linux-user/guest_selinux.c заводит каталог при старте первого процесса
+    (в соседнем каталоге под СЛУЧАЙНЫМ именем, потом renameat): enforce («0»;
+    запись и чтение — последнее записанное), policyvers 30, mls 1, deny_unknown 0,
+    reject_unknown 0, checkreqprot 0, load и null — ссылки на хозяйский /dev/null
+    (политика любого объёма принимается и никуда не идёт), status — страница
+    4096 байт (версия 1, остальное нули; читается и mmap), booleans/ и
+    policy_capabilities/ — пусты, initial_contexts/<имя>, места под access,
+    context, create, relabel, member, user, commit_pending_bools (ссылки на
+    хозяйский /dev/null — см. патч 0085).
+  * Словарь классов class/<класс>/index и perms/<право> — из политики самой прошивки
+    (двоичная /sepolicy дерева, версии 19…30: таблица классов с общими правами
+    и номерами); нет её или не разобралась — встроенный словарь основных классов
+    Android. Каталог класса заводится по ПЕРВОМУ обращению к пути под
+    class/<класс> (подключаемый вызов path_selinuxfs_touch, один раз на имя).
+    Класса нет в словаре — нет и каталога (ENOENT), как у ядра без такого класса.
+    Политика читается, если это обычный файл не больше 16 МБ и версия 19…30 (формат
+    сверен до 30); иначе встроенный словарь.
+  * ★ Защита от гостя (правка по проверке). dev — единственное место, куда гость пишет
+    сам, и ссылку с относительной целью («../../..») там транслятор не переписывает
+    (патч 0063 переписывает только абсолютные). Поэтому всё, что транслятор делает в
+    каталоге selinuxfs, — заведение, замена, чистка — идёт ОТНОСИТЕЛЬНО ОПИСАТЕЛЕЙ и
+    НИКОГДА НЕ ПО ССЫЛКАМ: openat с O_NOFOLLOW на каждом звене от корня дерева, fstatat с
+    AT_SYMLINK_NOFOLLOW, создание файлов с O_EXCL|O_NOFOLLOW, чистка (rm_rf_at) не заходит в
+    ссылки; временные каталоги — со СЛУЧАЙНЫМ именем («<имя>.<pid>» гость мог насажать ссылками
+    заранее, и чистка стёрла бы то, на что они ведут). Ссылка или файл гостя на месте
+    .selinuxfs снимается (сама запись, не цель) и каталог заводится заново; ссылка гостя на
+    месте class — классы не заводятся.
+  * guest_fs_fake (statfs, statfs64) и новый вызов в fstatfs, fstatfs64: под
+    /sys/fs/selinux f_type = 0xf97cff8c (SELINUX_MAGIC), f_flags без ST_RDONLY.
+  * /proc/filesystems — строка «nodev selinuxfs»; /proc/<…>/mounts — строка о
+    selinuxfs на /sys/fs/selinux (guest_fwinit.c, при GUEST_SELINUX=1).
+  * mount типа selinuxfs уже отвечал 0 (патч 0030).
+Тот же патч вносит в сборку qemu/src/guest_selinux.c (строка в meson.build).
+
+⚠️ Условие «GUEST_FWINIT=1 и GUEST_SELINUX=1» записано в util/path.c
+(selinuxfs_rest) и в qemu/src/guest_selinux.c (guest_selinux): util/ не вправе
+зависеть от linux-user/. Менять — в обоих местах.
+⚠️ path_selinuxfs_touch зовётся под замком path(): внутри нельзя вызывать path().
+⚠️ fstatfs по описателю сверяет НАСТОЯЩЕЕ имя (readlink /proc/self/fd/N — на телефоне
+/data/data/…) с корнем дерева через path_to_guest: стенд задаёт корень как
+/data/user/0/<пакет>/files/roots/N, и сравнение строк промахнулось бы.
+⚠️ Гостевой путь сверяется по префиксу «/sys/fs/selinux» как есть: «..» и
+«//» внутри пути (/sys/fs/../fs/selinux) path() сводит до перевода, а statfs по
+такому пути magic не получит — libselinux берёт точку без них.
+⚠️ Каталог dev у дерева должен быть (его готовит стенд); нет — транслятор
+заведёт пустой. Если каталог selinuxfs завести не вышло, путь уходит в
+несуществующее место (ENOENT): гость решит, что SELinux нет.
+⚠️ Без GUEST_FWINIT=1 или без GUEST_SELINUX=1 поведение ровно прежнее: на пути
+/sys/fs/selinux — ENOENT, в /proc/filesystems и mounts selinuxfs нет.
+
+Проверка: tests/qemu/selinux.sh, случаи «1», «2», «9» (враждебное дерево: ссылки гостя, предсказуемые
+имена) и «11» (корень через ссылку, политики: большая, версия 31, враждебные).
+
+
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -63,6 +63,7 @@
+ #include "accel/tcg/perf.h"
+ #include "guest_script.h"
+ #include "guest_fwinit.h"
++#include "guest_selinux.h"
+ 
+ #ifdef CONFIG_SEMIHOSTING
+ #include "semihosting/semihost.h"
+@@ -1117,6 +1118,12 @@
+     guest_fwinit_comm();
+     /* ★ То же (патч 0078): строка в GUEST_START_LOG о старте гостевой программы. */
+     guest_fwinit_start_log(target_argv[0]);
++    /*
++     * ★ SELinux «всё разрешено» (патч 0084): каталог selinuxfs в dev дерева — если
++     * его ещё нет — и заведение классов по первому обращению. Только при
++     * GUEST_FWINIT=1 и GUEST_SELINUX=1.
++     */
++    guest_selinux_start();
+ 
+     ret = loader_exec(execfd, exec_path, target_argv, target_environ, regs,
+         info, &bprm);
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -24,6 +24,7 @@
+   'guest_pagelog.c',
+   'guest_proc.c',
+   'guest_script.c',
++  'guest_selinux.c',
+   'guest_trace.c',
+   'guest_tls.c',
+   'elfload.c',
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -172,6 +172,7 @@
+ #include "guest_oom.h"
+ #include "guest_script.h"
+ #include "guest_fwinit.h"
++#include "guest_selinux.h"
+ 
+ /*
+  * ★ Отказ в смене владельца превращаем в успех.
+@@ -12360,6 +12361,7 @@
+ #ifdef TARGET_NR_fstatfs
+     case TARGET_NR_fstatfs:
+         ret = get_errno(fstatfs(arg1, &stfs));
++        guest_selinux_fstatfs(arg1, &stfs);         /* патч 0084 */
+         goto convert_statfs;
+ #endif
+ #ifdef TARGET_NR_statfs64
+@@ -12398,6 +12400,7 @@
+         return ret;
+     case TARGET_NR_fstatfs64:
+         ret = get_errno(fstatfs(arg1, &stfs));
++        guest_selinux_fstatfs(arg1, &stfs);         /* патч 0084 */
+         goto convert_statfs64;
+ #endif
+ #ifdef TARGET_NR_socketcall
+--- a/util/path.c
++++ b/util/path.c
+@@ -560,6 +560,38 @@
+         g_string_append_len(out, seg, len);
+     }
+     return g_string_free(out, FALSE);
++}
++
++/*
++ * ★★★ selinuxfs для «SELinux всё разрешено» (GUEST_FWINIT=1 И GUEST_SELINUX=1):
++ * гостевой /sys/fs/selinux — НАСТОЯЩИЙ каталог <корень>/dev/.selinuxfs, который
++ * заводит сам транслятор (linux-user/guest_selinux.c). Не sys/fs/selinux дерева:
++ * там у 2.3–4.4 ничего быть не должно (гость решил бы, что SELinux включён), а
++ * dev гостя — его tmpfs, стенд очищает его перед «Пуском» (состояние selinuxfs
++ * живёт ровно до следующей загрузки, как у ядра).
++ *
++ * path_selinuxfs_touch — подключаемый вызов транслятора: на ПЕРВОЕ обращение к
++ * каждому имени под selinuxfs (ответы path() кэшируются) он заводит то, что
++ * создаётся по требованию — каталог класса class/<класс>. Зовётся под замком
++ * path(): внутри нельзя вызывать path().
++ *
++ * ⚠️ Условие «GUEST_FWINIT равно 1 и GUEST_SELINUX равно 1» записано здесь и в
++ * linux-user/guest_selinux.c (guest_selinux): util/ собирается отдельно от
++ * linux-user/ и не вправе зависеть от него. Правишь одно — правь и второе.
++ */
++void (*path_selinuxfs_touch)(const char *rest);
++
++static bool selinuxfs_rest(const char *name, const char **rest)
++{
++    static int on = -1;
++
++    if (on < 0) {
++        const char *fw = getenv("GUEST_FWINIT");
++        const char *se = getenv("GUEST_SELINUX");
++
++        on = fw && strcmp(fw, "1") == 0 && se && strcmp(se, "1") == 0;
++    }
++    return on && has_prefix(name, "/sys/fs/selinux", rest);
+ }
+ 
+ void init_paths(const char *prefix)
+@@ -658,7 +690,13 @@
+         const char *rest;
+         char *full;
+ 
+-        if (sdcard_base && sdcard_prefix(save, &rest)) {
++        if (selinuxfs_rest(save, &rest)) {
++            /* ★ selinuxfs (патч 0084): каталог транслятора в dev дерева. */
++            full = g_strconcat(base, "/dev/.selinuxfs", rest, NULL);
++            if (path_selinuxfs_touch) {
++                path_selinuxfs_touch(rest);
++            }
++        } else if (sdcard_base && sdcard_prefix(save, &rest)) {
+             /* ★ Общая папка — свой перевод, см. sdcard_map. */
+             full = sdcard_map(rest);
+         } else {

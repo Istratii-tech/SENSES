@@ -1,0 +1,82 @@
+★★★ Каталог, созданный гостем, принадлежит ТОМУ, КТО ЕГО СОЗДАЛ.
+
+Патч 0028 завёл карту владельцев, но заполняет её только `chown`: «кому гость
+НАЗНАЧИЛ файл». А ядро назначает владельца ещё и молча — при создании, по
+действующему uid создателя. Этого у нас не было, и всё созданное гостем
+оставалось под правилом 0022 «свой файл выглядит как root».
+
+Видно это стало на приложении с многодексовостью (файловый менеджер в
+`/system/app`). Оно падает при каждом запуске:
+
+    E MultiDex  java.lang.IllegalArgumentException: Optimized data directory
+                /data/data/com.vendor.files/code_cache/secondary-dexes
+                is not owned by the current user. Shared storage cannot protect
+                your application from code injection attacks.
+
+Проверку делает сам Dalvik, в конструкторе `DexFile`:
+
+    if (Libcore.os.getuid() != Libcore.os.stat(parent).st_uid) throw …
+
+`getuid()` отдаёт uid приложения (модель личности, патч 0010), а `stat` по
+каталогу, который приложение только что создало само, отдавал root. Отсюда и
+отказ — и он не про наш стенд, а про здравую защиту от подмены кода: на живом
+устройстве такой каталог и правда принадлежит приложению.
+
+Лечение ровно на эту нехватку: после успешного `mkdir`/`mkdirat` записываем в
+карту действующие uid и gid гостя. Никакого нового состояния, никаких новых
+файлов — та же карта 0028, просто заполняется ещё и по второму естественному
+поводу.
+
+⚠️ ФАЙЛЫ (`open` с O_CREAT) НАМЕРЕННО НЕ ТРОГАЕМ. Проверка владельца, ради
+которой всё делается, читает КАТАЛОГ, а `open` пришлось бы разбирать на «создал»
+и «открыл существующий» — лишний вызов на горячем пути ради случая, которого
+пока никто не потребовал. Понадобится — добавить сюда же.
+
+⚠️ У `mkdirat` путь может быть относительным, и тогда он считается от чужого
+описателя, а карта работает по пути. Поэтому для него записываем только
+абсолютные пути и AT_FDCWD; в остальных случаях молчим, а не угадываем.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -10586,15 +10586,39 @@
+     case TARGET_NR_mkdir:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mkdir(path(p), guest_dir_mode(arg2)));
++        {
++            /*
++             * ★ Владелец нового каталога — создатель, как в ядре.
++             * Зачем — см. заголовок патча 0040.
++             */
++            const char *hp = path(p);
++
++            ret = get_errno(mkdir(hp, guest_dir_mode(arg2)));
++            if (ret == 0) {
++                guest_own_note_path(hp, 1, (uint32_t)guest_ids_geteuid(),
++                                  (uint32_t)guest_ids_getegid());
++            }
++        }
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+ #if defined(TARGET_NR_mkdirat)
+     case TARGET_NR_mkdirat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mkdirat(arg1, path(p), guest_dir_mode(arg3)));
++        {
++            const char *hp = path(p);
++
++            ret = get_errno(mkdirat(arg1, hp, guest_dir_mode(arg3)));
++            /*
++             * ⚠️ Только абсолютный путь (или AT_FDCWD): карта работает по
++             * пути, а относительный считается от чужого описателя.
++             */
++            if (ret == 0 && (hp[0] == '/' || arg1 == AT_FDCWD)) {
++                guest_own_note_path(hp, 1, (uint32_t)guest_ids_geteuid(),
++                                  (uint32_t)guest_ids_getegid());
++            }
++        }
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif

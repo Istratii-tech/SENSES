@@ -1,0 +1,130 @@
+Свой binder для гостя: перехват /dev/binder в linux-user.
+
+Гостю binder нужен ТОЛЬКО внутри себя — с хозяйским он не разговаривает
+никогда. А хозяйский ему и опасен: на телефоне /dev/binder существует, и
+гостевой ProcessState начинал говорить с живым драйвером Android 32-битными
+структурами (servicemanager прошивки получал «cannot become context manager
+(Not a typewriter)»).
+
+Поэтому open("/dev/binder") уходит нашему шиму (linux-user/guest_binder.c), а тот
+разговаривает с демоном binderd — драйвером binder в юзерспейсе. Шим и демон
+взяты из более ранней работы, где уже поднимали на этом телефоне полный стек
+Android 7; отличия — только разрядность гостя (32 бита против 64) и то, что
+шим живёт внутри qemu, а не в гостевом процессе.
+
+Четыре точки перехвата: open, ioctl, mmap, close. Всё остальное qemu делает как
+обычно.
+
+⚠️ Номер ioctl приводится к uint32_t: значения вида 0xc0186201 в int
+отрицательны, и знаковое расширение до unsigned long дало бы
+0xffffffffc0186201 — ни одна ветка switch не совпала бы, а отладка выглядела бы
+как «шим не видит запросов».
+
+Сами guest_*.c/.h и binder_proto.h живут в нашем дереве (qemu/src/) и копируются в
+linux-user/ при сборке: файл на 1300 строк внутри патча правился бы мучительно.
+
+⚠️ Список наших файлов для meson.build — ТОЛЬКО здесь, одним куском. Когда
+каждый патч добавлял свою строку по очереди, следующий ломал проверку
+«уже наложен» у предыдущего (контекст сдвигался), и сборка отказывалась идти без
+FRESH=1 после любой правки. Новый файл — дописать в этот список.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -138,6 +138,7 @@
+ #include "user/safe-syscall.h"
+ #include "qemu/guest-random.h"
+ #include "qemu/selfmap.h"
++#include "guest_binder.h"
+ #include "user/syscall-trace.h"
+ #include "special-errno.h"
+ #include "qapi/error.h"
+@@ -5580,6 +5581,22 @@
+     int target_size;
+     void *argptr;
+ 
++    /*
++     * ★ Наш binder: его ioctl обрабатывает шим, в таблицах qemu этих номеров
++     * нет вовсе.
++     *
++     * ⚠️ Приведение к uint32_t обязательно: номера вида 0xc0186201 в int
++     * отрицательны, и знаковое расширение до unsigned long дало бы
++     * 0xffffffffc0186201 — ни один case не совпал бы.
++     */
++    {
++        abi_long bret;
++
++        if (guest_binder_ioctl(fd, (unsigned long)(uint32_t)cmd, arg, &bret)) {
++            return bret < 0 ? -host_to_target_errno(errno) : bret;
++        }
++    }
++
+     ie = ioctl_entries;
+     for(;;) {
+         if (ie->target_cmd == 0) {
+@@ -5887,6 +5904,18 @@
+ static abi_long do_mmap(abi_ulong addr, abi_ulong len, int prot,
+                         int target_flags, int fd, off_t offset)
+ {
++    /*
++     * ★ mmap на нашем binder: настоящий драйвер отображает сюда свои страницы
++     * для приёма транзакций, у нас это делает шим (см. guest_binder.c).
++     */
++    if (fd >= 0 && guest_binder_owns(fd)) {
++        abi_ulong baddr = 0;
++
++        if (guest_binder_mmap(fd, len, &baddr)) {
++            return baddr == (abi_ulong)-1 ? -TARGET_ENOMEM : (abi_long)baddr;
++        }
++    }
++
+     /*
+      * The historical set of flags that all mmap types implicitly support.
+      */
+@@ -8333,6 +8362,20 @@
+ #endif
+         { NULL, NULL, NULL }
+     };
++
++    /*
++     * ★ Гостевой /dev/binder — наш: за ним стоит binderd в юзерспейсе, а не
++     * драйвер ядра. Отдавать гостю ХОЗЯЙСКИЙ /dev/binder нельзя ни в каком
++     * виде: на телефоне он существует, и гостевой ProcessState начинал
++     * говорить с ним 32-битными структурами.
++     */
++    {
++        int bfd;
++
++        if (guest_binder_try_open(fname, &bfd)) {
++            return bfd < 0 ? -host_to_target_errno(errno) : bfd;
++        }
++    }
+ 
+     /* if this is a file from /proc/ filesystem, expand full name */
+     proc_name = realpath(fname, NULL);
+@@ -9119,6 +9162,9 @@
+         return get_errno(pidfd_getfd(arg1, arg2, arg3));
+ #endif
+     case TARGET_NR_close:
++        /* ★ Демон должен узнать о закрытии сессии: он разошлёт извещения о
++         * смерти тем, кто их просил. */
++        guest_binder_close(arg1);
+         fd_trans_unregister(arg1);
+         return get_errno(close(arg1));
+ #if defined(__NR_close_range) && defined(TARGET_NR_close_range)
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -8,6 +8,14 @@
+ common_user_inc += include_directories('include')
+ 
+ linux_user_ss.add(files(
++  'guest_ashmem.c',
++  'guest_binder.c',
++  'guest_fb.c',
++  'guest_fs.c',
++  'guest_ids.c',
++  'guest_input.c',
++  'guest_net.c',
++  'guest_tls.c',
+   'elfload.c',
+   'exit.c',
+   'fd-trans.c',

@@ -1,0 +1,162 @@
+★★★ Слежка: кто отбирает у гостя ИСПОЛНЯЕМУЮ страницу и сбрасываются ли переводы.
+
+Отладочная, по умолчанию выключена: нет переменной GUEST_PAGE_LOG — нет ни одной
+лишней команды на горячем пути (проверка указателя). Нужна для единственной
+незакрытой беды: браузер прошивки с включённым JavaScript падает прыжком в
+память, которой гостю уже не выдавали.
+
+  Fatal signal 11 (SIGSEGV) at 0x3a0cf960, thread (WebViewCoreThre)
+  PC=0x3a0cf960 [гость: страница не выдавалась] в 33a19000-3c000000 ---p
+  LR=0x3c78d1b1 [гость: rw-]                    в 3c700000-3c800000 rw-p
+  след по стеку: libjs.so ×5, дальше libbrowsercore.so ×7
+
+Права в скобках — это ПАМЯТЬ ГЛАЗАМИ ТРАНСЛЯТОРА. Со страницы без PAGE_EXEC он
+код не переводит вовсе (probe_access_internal отказывает на выборке команды),
+значит страница была исполняемой и права потеряла. Подробный разбор — в шапке
+linux-user/guest_pagelog.c.
+
+Три точки, и все три нужны разом:
+
+1. page_set_flags — ЕДИНСТВЕННАЯ воронка, через которую в qemu проходят mmap,
+   munmap, mprotect и mremap. Пишем только случаи, где PAGE_EXEC был в старых
+   правах или появился в новых: прочих за загрузку сотни тысяч, а этих единицы
+   на библиотеку. Главное в строке — «переводы=сброшены/ОСТАЛИСЬ» (inval_tb).
+
+2. madvise(MADV_DONTNEED) на исполняемом промежутке. Отдельно от первой точки:
+   прав он не меняет и в page_set_flags не заходит, а содержимое страниц
+   выбрасывает. ⚠️ Отдельно помечаем «сквозные=НЕТ»: без PAGE_PASSTHROUGH qemu
+   МОЛЧА НИЧЕГО НЕ ДЕЛАЕТ и отвечает гостю успехом (его собственное решение,
+   комментарий стоит прямо над этим местом) — и сброс переводов из патча 0047
+   в этом случае не выполняется никогда.
+
+3. Сам отказ на выборке команды. Строка пишется один раз, в миг падения, и
+   связывает журнал с отчётом о падении.
+
+Что искать в журнале после воспроизведения — страницы из PC и LR отчёта:
+  • строка есть, «сброшены»  → дыра не здесь, смотреть, кто прыгнул;
+  • строка есть, «ОСТАЛИСЬ»  → вот она;
+  • строк нет вовсе          → страницу отбирают мимо page_set_flags.
+
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -15,6 +15,7 @@
+   'guest_ids.c',
+   'guest_input.c',
+   'guest_net.c',
++  'guest_pagelog.c',
+   'guest_proc.c',
+   'guest_tls.c',
+   'elfload.c',
+--- a/accel/tcg/user-exec.c
++++ b/accel/tcg/user-exec.c
+@@ -475,6 +475,15 @@
+  done:
+     return inval_tb;
+ }
++
++/*
++ * ★ Слежка за исполняемыми страницами. Живёт в linux-user/guest_pagelog.c;
++ * объявлена здесь, а не заголовком, потому что каталога linux-user в путях
++ * поиска accel/tcg нет, и тянуть его сюда ради трёх строк незачем.
++ */
++int guest_plog_on(void);
++void guest_plog(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
++const char *guest_plog_prot(int flags, char *buf);
+ 
+ /*
+  * Modify the flags of a page and invalidate the code if necessary.
+@@ -485,6 +494,11 @@
+ {
+     bool reset = false;
+     bool inval_tb = false;
++    /*
++     * Старые права запоминаем ДО правки и только при включённой слежке:
++     * page_get_flags — поиск по дереву промежутков, даром он не даётся.
++     */
++    int guest_old = guest_plog_on() ? page_get_flags(start) : 0;
+ 
+     /* This function should never be called with addresses outside the
+        guest address space.  If this assert fires, it probably indicates
+@@ -518,6 +532,20 @@
+     }
+     if (inval_tb) {
+         tb_invalidate_phys_range(start, last);
++    }
++    if (guest_plog_on()) {
++        int guest_new = page_get_flags(start);
++
++        if ((guest_old | guest_new) & PAGE_EXEC) {
++            char ob[8], nb[8];
++
++            guest_plog("страницы 0x%08lx-0x%08lx: %s -> %s, заново=%s, "
++                     "переводы=%s",
++                     (unsigned long)start, (unsigned long)last,
++                     guest_plog_prot(guest_old, ob), guest_plog_prot(guest_new, nb),
++                     reset ? "да" : "нет",
++                     inval_tb ? "сброшены" : "ОСТАЛИСЬ");
++        }
+     }
+ }
+ 
+@@ -809,6 +837,18 @@
+         return TLB_INVALID_MASK;
+     }
+ 
++    /*
++     * ★ Отказ на ВЫБОРКЕ КОМАНДЫ — это и есть миг падения: гость передал
++     * управление туда, где транслятору исполнять нечего. Строка пишется один
++     * раз и связывает журнал с отчётом о падении.
++     */
++    if (access_type == MMU_INST_FETCH && guest_plog_on()) {
++        char pb[8];
++
++        guest_plog("★★★ ПРЫЖОК В НЕИСПОЛНЯЕМОЕ: 0x%08lx, права %s",
++                 (unsigned long)addr,
++                 guest_plog_prot(page_get_flags(addr), pb));
++    }
+     cpu_loop_exit_sigsegv(env_cpu(env), addr, access_type, maperr, ra);
+ }
+ 
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -27,6 +27,8 @@
+ #include "qemu/interval-tree.h"
+ /* ★ Для tb_invalidate_phys_range — см. MADV_DONTNEED ниже. */
+ #include "exec/exec-all.h"
++/* ★ Слежка за исполняемыми страницами — см. MADV_DONTNEED ниже. */
++#include "guest_pagelog.h"
+ 
+ #ifdef TARGET_ARM
+ #include "target/arm/cpu-features.h"
+@@ -1033,6 +1035,29 @@
+         ret = -EINVAL;
+         /* fall through */
+     case MADV_DONTNEED:
++        /*
++         * ★ Выброс содержимого ИСПОЛНЯЕМЫХ страниц. Прав он не меняет, в
++         * page_set_flags не заходит, а кода на странице после него нет —
++         * значит след от него нужен отдельный.
++         *
++         * ⚠️ «сквозные=НЕТ» означает, что ниже НЕ БУДЕТ СДЕЛАНО НИЧЕГО, а
++         * гостю ответят успехом (ret остался 0). Вместе с этим не сработает
++         * и сброс переводов из патча 0047.
++         */
++        if (guest_plog_on() && len) {
++            int f = page_get_flags(start);
++
++            if (f & PAGE_EXEC) {
++                char fb[8];
++
++                guest_plog("madvise(DONTNEED) 0x%08lx+0x%lx: права %s, "
++                         "сквозные=%s",
++                         (unsigned long)start, (unsigned long)len,
++                         guest_plog_prot(f, fb),
++                         page_check_range(start, len, PAGE_PASSTHROUGH)
++                             ? "да" : "НЕТ");
++            }
++        }
+         if (page_check_range(start, len, PAGE_PASSTHROUGH)) {
+             ret = get_errno(madvise(g2h_untagged(start), len, advice));
+             if ((advice == MADV_DONTNEED) && (ret == 0)) {

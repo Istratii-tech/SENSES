@@ -1,0 +1,46 @@
+Привязка netlink гостю: подмена вместо отказа (продолжение 0014).
+
+Симптом (уже после 0019):
+
+  E Netd  Unable to bind netlink socket: Permission denied
+  E Netd  Unable to start NetlinkManager (Permission denied)
+  · netd завершился, код 1
+
+а без netd загрузка встаёт навсегда: NetworkManagementService.create ждёт его
+соединения на mConnectedSignal.await() без таймаута.
+
+Причина. Патч 0014 подставляет безвредный AF_UNIX только когда САМ вызов
+socket(PF_NETLINK…) отказал по правам. На этом телефоне сокет создаётся
+успешно, а запрещён следующий шаг — bind: политика SELinux не даёт
+untrusted_app привязать netlink_kobject_uevent_socket.
+
+Решение — то же по смыслу и в том же месте: за тем же НОМЕРОМ дескриптора
+ставим AF_UNIX (dup2), после чего он ведёт себя как подставной из 0014 —
+чтение блокируется навсегда, потому что событий ядра у нас всё равно нет.
+Номер дескриптора не меняется, поэтому гость ничего не замечает.
+
+★ Только отказ по правам и только сокеты netlink (домен проверяется через
+SO_DOMAIN): чужим отказам мы не хозяева.
+
+Код — в linux-user/guest_net.c (guest_net_bind_fallback).
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3380,7 +3380,16 @@
+ 
+     addrlen = guest_unix_path(addr, addrlen, &unbuf);
+ 
+-    return get_errno(bind(sockfd, addr, addrlen));
++    ret = get_errno(bind(sockfd, addr, addrlen));
++    /*
++     * ★ Привязать netlink гостю не дали — подставляем безвредный AF_UNIX за тем
++     * же номером дескриптора. Без этого netd прошивки 4.1 не запускается, а без
++     * него загрузка встаёт навсегда (см. linux-user/guest_net.c).
++     */
++    if (is_error(ret) && guest_net_bind_fallback(sockfd)) {
++        return 0;
++    }
++    return ret;
+ }
+ 
+ /* do_connect() Must return target values and target errnos. */

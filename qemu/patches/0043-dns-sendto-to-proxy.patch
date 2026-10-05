@@ -1,0 +1,14 @@
+--- a/linux-user/syscall.c	2026-09-02 12:06:16.971112406 +0300
++++ b/linux-user/syscall.c	2026-09-02 12:06:16.981112406 +0300
+@@ -3816,6 +3816,11 @@
+         if (ret) {
+             goto fail;
+         }
++        /*
++         * ★ Тот же увод, что и в connect: резолвер прошивки шлёт запрос имени
++         * через sendto, без соединения. См. guest_net.c: guest_http_redirect.
++         */
++        guest_http_redirect(fd, addr, addrlen);
+         ret = get_errno(safe_sendto(fd, host_msg, len, flags, addr, addrlen));
+     } else {
+         ret = get_errno(safe_sendto(fd, host_msg, len, flags, NULL, 0));

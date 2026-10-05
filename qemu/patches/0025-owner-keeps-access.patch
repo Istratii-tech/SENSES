@@ -1,0 +1,98 @@
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -7867,6 +7867,59 @@
+  * приложения принадлежит его uid» теперь будут видеть root. Если такое
+  * всплывёт, отключается переменной GUEST_STAT_ROOT=0.
+  */
++static int guest_keep_mode(void)
++{
++    /*
++     * ★★★ Права, которые не запирают нас самих.
++     *
++     * Прошивка местами создаёт каталоги с режимом 0000 — например зигота 4.4
++     * под эмулированную SD-карту: fs_prepare_dir("/mnt/shell/emulated/0",
++     * 0000, 0, 0). На устройстве это безопасно: там процесс root, а ему режим
++     * не преграда. У нас процесс обычный, и в такой каталог не войти даже его
++     * создателю:
++     *
++     *   d---------  2 …  /mnt/shell/emulated/0
++     *   E cutils   Failed to lstat(/mnt/shell/emulated/0): No such file or directory
++     *   E dalvikvm cannot mountExternalStorage(): No such file or directory
++     *   E dalvikvm VM aborting
++     *
++     * — и ни один процесс приложения не выживает.
++     *
++     * Поэтому владельцу всегда оставляем чтение и запись, а каталогам ещё и
++     * вход. Гость увидит режим не тот, что просил, и поправит его через chmod —
++     * тот пройдёт через ту же поправку и вернёт успех, так что fs_prepare_dir
++     * останется доволен.
++     *
++     * ⚠️ Ложь того же рода, что прощение chown (0016) и подмена владельца при
++     * stat (0022): песочница не может быть root, и права в ней — не защита, а
++     * помеха. Отключается переменной GUEST_MODE_KEEP=1.
++     */
++    static int state;                  /* 0 — не считано, 1 — правим, 2 — нет */
++    if (state == 0) {
++        const char *k = getenv("GUEST_MODE_KEEP");
++        state = (k && k[0] == '1') ? 2 : 1;
++    }
++    return state == 2;
++}
++
++static mode_t guest_dir_mode(mode_t m)
++{
++    return guest_keep_mode() ? m : (m | 0700);
++}
++
++static mode_t guest_chmod_mode(const char *hostpath, mode_t m)
++{
++    struct stat sb;
++    if (guest_keep_mode()) {
++        return m;
++    }
++    m |= 0600;
++    if (hostpath && lstat(hostpath, &sb) == 0 && S_ISDIR(sb.st_mode)) {
++        m |= 0100;
++    }
++    return m;
++}
++
+ static void guest_stat_as_root(struct stat *st)
+ {
+     static uid_t me;
+@@ -9785,7 +9838,7 @@
+     case TARGET_NR_chmod:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chmod(path(p), arg2));
++        ret = get_errno(chmod(path(p), guest_chmod_mode(path(p), arg2)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10112,7 +10165,7 @@
+     case TARGET_NR_mkdir:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mkdir(path(p), arg2));
++        ret = get_errno(mkdir(path(p), guest_dir_mode(arg2)));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10120,7 +10173,7 @@
+     case TARGET_NR_mkdirat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mkdirat(arg1, path(p), arg3));
++        ret = get_errno(mkdirat(arg1, path(p), guest_dir_mode(arg3)));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -10979,7 +11032,7 @@
+     case TARGET_NR_fchmodat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(fchmodat(arg1, path(p), arg3, 0));
++        ret = get_errno(fchmodat(arg1, path(p), guest_chmod_mode(path(p), arg3), 0));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif

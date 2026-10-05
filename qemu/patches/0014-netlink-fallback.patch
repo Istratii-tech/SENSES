@@ -1,0 +1,103 @@
+netlink гостю подставной: без него netd не стартует, а без netd загрузка встаёт.
+
+Симптом двойной. Сначала в гостевом логе:
+
+  I Netd  Netd 1.0 starting
+  E Netd  Unable to create uevent socket: Permission denied
+  E Netd  Unable to start NetlinkManager (Permission denied)
+  · netd завершился, код 1
+
+а следом — бесконечная лента в system_server:
+
+  E NetdConnector  Communications error
+  E NetdConnector  java.io.IOException: No such file or directory
+        at android.net.LocalSocketImpl.connectLocal(Native Method)
+  W NetdConnector  Failed to receive response from daemon
+
+и загрузка не идёт дальше «NetworkManagement Service» НИКОГДА:
+NetworkManagementService.create ждёт соединения netd на
+mConnectedSignal.await(), без таймаута.
+
+Причина. NetlinkManager::start первым делом заводит
+socket(PF_NETLINK, SOCK_DGRAM, NETLINK_KOBJECT_UEVENT), а политика SELinux не
+пускает untrusted_app создавать netlink_kobject_uevent_socket. Следом идёт
+setsockopt(SO_RCVBUFFORCE), который требует CAP_NET_ADMIN — то есть отказал бы
+и на любом другом сокете. Отказ на любом из двух netd считает смертельным.
+
+Решение — то же, что с ashmem и binder: безвредная замена там, где хозяйское
+ядро отказывает. Гость получает обычный AF_UNIX SOCK_DGRAM, несвязанный и
+никому не известный; чтение из него честно блокируется навсегда, потому что
+событий ядра у нас и не будет. Поток-слушатель netd спит на нём, а приём команд
+от system_server работает.
+
+★ Подмена включается ТОЛЬКО когда настоящий вызов отказал по правам (EACCES или
+EPERM). Там, где netlink доступен, гость получит настоящий сокет и настоящие
+события: прятать работающую возможность подменой нельзя.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -160,6 +160,7 @@
+ #include "qemu/selfmap.h"
+ #include "guest_binder.h"
+ #include "guest_ids.h"
++#include "guest_net.h"
+ #include "user/syscall-trace.h"
+ #include "special-errno.h"
+ #include "qapi/error.h"
+@@ -2092,6 +2093,15 @@
+     struct ip_mreqn *ip_mreq;
+     struct ip_mreq_source *ip_mreq_source;
+ 
++    /*
++     * Подставной netlink: netd просит SO_RCVBUFFORCE, а он требует
++     * CAP_NET_ADMIN и отказал бы даже на AF_UNIX. Отказ netd считает
++     * смертельным, поэтому отвечаем успехом, не делая ничего.
++     */
++    if (guest_net_owns(sockfd)) {
++        return 0;
++    }
++
+     switch(level) {
+     case SOL_TCP:
+     case SOL_UDP:
+@@ -3172,6 +3182,20 @@
+     }
+ 
+     ret = get_errno(socket(domain, type, protocol));
++    if (ret < 0) {
++        /*
++         * ★ netlink гостю не дают — подставляем безвредный AF_UNIX.
++         * Политика SELinux не пускает untrusted_app создавать
++         * netlink_kobject_uevent_socket, и netd прошивки на этом умирает:
++         *   E Netd  Unable to create uevent socket: Permission denied
++         * а без netd загрузка встаёт навсегда (см. linux-user/guest_net.c).
++         */
++        int nfd;
++
++        if (guest_net_socket_fallback(domain, type, protocol, &nfd)) {
++            return sock_flags_fixup(nfd, target_type);
++        }
++    }
+     if (ret >= 0) {
+         ret = sock_flags_fixup(ret, target_type);
+         if (type == SOCK_PACKET) {
+@@ -3268,6 +3292,11 @@
+ 
+     if ((int)addrlen < 0) {
+         return -TARGET_EINVAL;
++    }
++
++    /* Подставной netlink: гость шлёт сюда sockaddr_nl, для AF_UNIX пустой. */
++    if (guest_net_owns(sockfd)) {
++        return 0;
+     }
+ 
+     /* ⚠️ Буфер по РАЗМЕРУ sockaddr_un, а не по addrlen: путь под корнем
+@@ -9368,6 +9397,7 @@
+         /* ★ Демон должен узнать о закрытии сессии: он разошлёт извещения о
+          * смерти тем, кто их просил. */
+         guest_binder_close(arg1);
++        guest_net_close(arg1);
+         fd_trans_unregister(arg1);
+         return get_errno(close(arg1));
+ #if defined(__NR_close_range) && defined(TARGET_NR_close_range)

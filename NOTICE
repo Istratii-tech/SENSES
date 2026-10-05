@@ -1,0 +1,355 @@
+# NOTICE — third-party components and their licences
+
+This file answers one question: **what inside the package is not ours, under
+which licence, and where to get its source.**
+
+It describes the whole application package. Paths outside `qemu/`, `licenses/`
+and the files at the root of this repository (for example `guest/`, `art/`,
+`tools/`) name parts of the application's own source tree, which is not part of
+this source distribution.
+
+---
+
+## 1. QEMU — GNU GPL version 2
+
+`libqemu.so` inside the APK is a **modified QEMU**, built from source with our
+changes.
+
+| | |
+|---|---|
+| upstream version | **QEMU 8.2.4** |
+| obtained from | `https://download.qemu.org/qemu-8.2.4.tar.xz` (132694904 bytes) |
+| sha256 of that archive | `ecf5537feab92641b99d7482f551f2195d3a5bd34acef9d52bfbff353a607397` (the build script refuses any other file) |
+| licence | GNU General Public License, version 2 (see `COPYING`); QEMU's own statement on the licences of its files is in `licenses/QEMU-LICENSE.txt` |
+| our patches | **94** (`qemu/patches/*.patch`) |
+| files we added | **39** (`qemu/src/`, 14375 lines) |
+
+### 1.1. How to get the source code
+
+The complete corresponding source is in this same repository:
+
+* `qemu/patches/` — every patch we apply to QEMU;
+* `qemu/src/` — our own files, compiled into QEMU;
+* `qemu/build-android.sh` — the build script (it also downloads the upstream
+  QEMU tarball and applies the patches). The build is pinned: the script checks
+  the sha256 of the QEMU archive and of the Alpine root it builds in, and writes
+  `qemu/build/BUILD-MANIFEST.txt` (package versions, compiler, patches, checksum
+  of the result). See `README.md`.
+
+To rebuild `libqemu.so` from source, on an **aarch64 Linux** host with root:
+
+```bash
+sudo ./qemu/build-android.sh
+```
+
+**Written offer.** If you received only a binary package without sources, the
+complete corresponding source is published at
+`https://github.com/Istratii-tech/Senses`. On request we will give any third
+party, for a charge no more than the cost of physically performing source
+distribution, a complete machine-readable copy of the corresponding source code
+of `libqemu.so` (installed in the package also as `qemu-arm`), including the
+unmodified QEMU 8.2.4 archive, and the source of the libraries listed in
+section 1.3. This offer is valid for at least three years after the last time
+we distributed `libqemu.so`, as GPLv2 section 3(b) requires. To make a request,
+open an issue at `https://github.com/Istratii-tech/Senses/issues` or write to
+`https://t.me/istratii_tech`.
+
+### 1.2. What exactly was changed in QEMU
+
+**QEMU files modified by our patches.** A notice of modification is written
+into each of them at build time — see the step “ставлю пометки об изменении
+(GPLv2 §2a)” in `qemu/build-android.sh`:
+
+| file |
+|---|
+| `accel/tcg/cpu-exec.c` |
+| `accel/tcg/tb-jmp-cache.h` |
+| `accel/tcg/user-exec.c` |
+| `include/qemu/path.h` |
+| `linux-user/arm/cpu_loop.c` |
+| `linux-user/arm/signal.c` |
+| `linux-user/arm/target_proc.h` |
+| `linux-user/elfload.c` |
+| `linux-user/exit.c` |
+| `linux-user/generic/sockbits.h` |
+| `linux-user/main.c` |
+| `linux-user/meson.build` |
+| `linux-user/mmap.c` |
+| `linux-user/signal.c` |
+| `linux-user/syscall.c` |
+| `linux-user/user-internals.h` |
+| `tcg/tcg.c` |
+| `util/path.c` |
+
+**Files we added to `linux-user/`.** Each carries the header
+`SPDX-License-Identifier: GPL-2.0-or-later`. Dates of change:
+2026-08-29 … 2026-10-05.
+
+| file | lines |
+|---|---|
+| `binder_proto.h` | 353 |
+| `guest_alarm.c` | 274 |
+| `guest_alarm.h` | 23 |
+| `guest_alarm_core.h` | 588 |
+| `guest_ashmem.c` | 396 |
+| `guest_ashmem.h` | 22 |
+| `guest_binder.c` | 2667 |
+| `guest_binder.h` | 27 |
+| `guest_fb.c` | 384 |
+| `guest_fb.h` | 21 |
+| `guest_fs.c` | 448 |
+| `guest_fs.h` | 22 |
+| `guest_fwinit.c` | 772 |
+| `guest_fwinit.h` | 92 |
+| `guest_ids.c` | 775 |
+| `guest_ids.h` | 93 |
+| `guest_input.c` | 479 |
+| `guest_input.h` | 22 |
+| `guest_input_pump.h` | 559 |
+| `guest_kill.c` | 236 |
+| `guest_kill.h` | 65 |
+| `guest_net.c` | 1196 |
+| `guest_net.h` | 82 |
+| `guest_oom.c` | 159 |
+| `guest_oom.h` | 28 |
+| `guest_pagelog.c` | 779 |
+| `guest_pagelog.h` | 62 |
+| `guest_proc.c` | 385 |
+| `guest_proc.h` | 45 |
+| `guest_procpath.h` | 115 |
+| `guest_script.c` | 176 |
+| `guest_script.h` | 43 |
+| `guest_selinux.c` | 2192 |
+| `guest_selinux.h` | 91 |
+| `guest_tls.c` | 168 |
+| `guest_tls.h` | 26 |
+| `guest_trace.c` | 231 |
+| `guest_trace.h` | 31 |
+| `guest_xattr.h` | 248 |
+
+Purpose of the changes: emulating the `/dev/binder` driver, the framebuffer,
+input, networking and `ashmem` for the guest system, a trace of the guest on the
+host clock (`guest_trace.c`), the importance of guest processes as the host
+kernel sees it (`guest_oom.c`), running `#!` scripts and answering `execve` errors
+the way the kernel does (`guest_script.c`), the kernel-like services a firmware's
+own `/init` expects when it is run under the translator (device nodes, kernel
+command line, journals for the stand: `guest_fwinit.c`), the SELinux “everything is
+allowed” answers the same `/init` needs on Android 5.0 and newer (a selinuxfs directory,
+process attributes, file labels, the peer context of a socket: `guest_selinux.c`; file labels alone,
+without the rest of SELinux, for Android 7.x started by the stand itself), the guest's own `user.*`
+extended attributes kept on the real file of the phone (`guest_xattr.h`), what the guest sees of the
+stand: the names of its UNIX sockets as guest paths and the stand's own descriptors hidden from its
+`/proc/self/fd` (patches 0093, 0094, `guest_proc.c`), the guest's own view of its process in `/proc` also
+through `task/<thread>/` and `thread-self` (patch 0095, `guest_procpath.h`), a journal of
+the signals one guest process sends to another — who, to whom, which signal (`guest_kill.c`), the
+alarm device `/dev/alarm` of Android kept on the phone's timers (patch 0096, `guest_alarm.c`,
+`guest_alarm_core.h`), the return from a signal handler into Thumb code (`linux-user/arm/signal.c`), the sessions of the emulated
+touchscreen and their relay threads, which end as soon as the guest closes the device by any path and
+greet the stand with a session token (`guest_input_pump.h`), plus working around the
+ways Android behaves as a *host* (paths, permissions, identifiers, SELinux
+restrictions). Every patch begins with a description of the symptom it exists
+for. The numbers and both tables of this section are checked against the tree
+before every release.
+
+The declarations of the Linux binder ioctl interface in `qemu/src/binder_proto.h`
+follow `include/uapi/linux/android/binder.h` of the Linux kernel (GPL-2.0 WITH
+Linux-syscall-note); the rest of that file, and the “shim <-> binderd” protocol,
+are ours.
+
+### 1.3. Libraries statically linked into `libqemu.so`
+
+`libqemu.so` is built on Alpine Linux v3.20 with musl and links the following
+libraries statically. The combined program is distributed under the GNU GPL
+version 2 (for the LGPL libraries, as permitted by LGPL-2.1 section 3); the build
+script `qemu/build-android.sh` lets you rebuild and relink everything. The
+versions below are the Alpine v3.20 packages (checked in the build chroot with
+`apk info -v`, and by the strings of the binary); the exact list of packages of
+every build is written to `BUILD-MANIFEST.txt`.
+
+| component | Alpine package | licence | source |
+|---|---|---|---|
+| GLib | `glib-2.80.5-r0` | LGPL-2.1-or-later | https://download.gnome.org/sources/glib/2.80/glib-2.80.5.tar.xz |
+| GNU gettext (libintl) | `gettext-0.22.5-r0` | LGPL-2.1-or-later | https://ftp.gnu.org/gnu/gettext/gettext-0.22.5.tar.xz |
+| musl libc | `musl-1.2.5-r3` | MIT (see `licenses/musl-COPYRIGHT.txt`) | https://musl.libc.org/releases/musl-1.2.5.tar.gz |
+| zlib (crc32 only) | `zlib-1.3.2-r0` | Zlib (see `licenses/zlib.txt`) | https://zlib.net/zlib-1.3.2.tar.gz |
+| libgcc (GCC runtime) | `libgcc-13.2.1_git20240309-r1` | GPL-3.0-or-later with the GCC Runtime Library Exception 3.1 | https://gcc.gnu.org (GCC 13 branch, snapshot of 2024-03-09) |
+
+Alpine's own patches and build recipes for these packages are in the aports tree
+of the same release: `https://gitlab.alpinelinux.org/alpine/aports`, branch
+`3.20-stable`. The GCC Runtime Library Exception 3.1 is published at
+`https://www.gnu.org/licenses/gcc-exception-3.1.html`.
+
+Licence texts: `licenses/LGPL-2.1.txt` (also the text of QEMU's `COPYING.LIB`,
+which covers the LGPL parts of QEMU itself), `licenses/musl-COPYRIGHT.txt`,
+`licenses/zlib.txt`, `licenses/QEMU-LICENSE.txt`.
+
+---
+
+## 2. Libraries bundled inside the application package
+
+### 2.1. Bouncy Castle 1.70 — Bouncy Castle Licence
+
+`bcprov`, `bctls`, `bcpkix` and `bcutil` (version 1.70) are bundled **inside**
+the application package.
+
+Why they are there: the guest system speaks only TLS 1.0, which current Android
+no longer offers — its TLS provider dropped TLSv1 entirely. So our proxy speaks
+TLS to the guest itself, in pure Java, and uses the phone’s modern TLS when
+talking to the outside world.
+
+* licence text: `licenses/BouncyCastle.txt` (reproduced verbatim from
+  `org/bouncycastle/LICENSE` inside the distributed jar);
+* source code: `https://github.com/bcgit/bc-java` (tag `r1rv70`).
+
+The jars are used **unmodified**.
+
+### 2.2. Kotlin standard library 2.0.21 and JetBrains annotations 13.0 — Apache License 2.0
+
+The application is written in Kotlin. The Kotlin standard library (the `kotlin`
+packages, about a thousand classes and its `.kotlin_builtins` resources) and the
+JetBrains annotations (`org.jetbrains.annotations`, `org.intellij.lang`; a
+dependency of the standard library) are compiled into `classes.dex` of the
+application package. They are used **unmodified**.
+
+* licence text: `licenses/Apache-2.0.txt`; the jars of these libraries carry no
+  `NOTICE` file of their own;
+* source code: `https://github.com/JetBrains/kotlin` (version 2.0.21) and
+  `https://github.com/JetBrains/java-annotations` (version 13.0).
+
+---
+
+## 3. Android Open Source Project headers — Apache License 2.0
+
+Thirteen header files under `guest/aosp44/` (`cutils/` 2, `hardware/` 7,
+`sync/` 1, `system/` 3) come from the Android Open Source Project, tag
+`android-4.4.4_r2`. They define the interfaces of the hardware modules that the
+guest system expects (audio, graphics buffers, framebuffer, frame composer, and
+the module loader), and our `audio.primary.default.so`, `gralloc.default.so`,
+`hwcomposer.default.so` and `consumerir.default.so` are compiled against them.
+The compiled libraries contain no text of these headers.
+
+* licence text: `licenses/Apache-2.0.txt`;
+* each file keeps its original copyright header;
+* the files are used **unmodified** (byte-identical to the upstream tag).
+
+---
+
+## 4. The application itself
+
+The Android application (`tech.istratii.senses`, Kotlin) and its own libraries
+are **a separate program**. The libraries in the package are:
+
+* on the phone (arm64, `lib/arm64-v8a/`, built with the Android NDK):
+  `libglbridge.so` (the GL bridge, loaded into the application),
+  `libglserverd.so` (the GL server), `libbinderd.so` (`binderd`, the binder
+  daemon), `libguestrun.so` (`guestrun`, the launcher of guest programs) and
+  `libbtstub.so` (`btstub`, a stand-in for one binder service of the guest). They
+  link dynamically only against the system libraries of the phone (libc, libm,
+  libdl, liblog, libandroid, libEGL, libGLESv1/v2/v3). `libqemu.so` in the same
+  directory is the modified QEMU of section 1 and is not covered by this
+  paragraph;
+* in the guest (ARM32, inside `assets/tools.payload`, copied by the application
+  into the guest tree on the device): `libGLES.so`, `libGLESfollow.so`,
+  `libashmemshim.so`, `noop`, `audio.primary.default.so`, `gralloc.default.so`,
+  `hwcomposer.default.so` and `consumerir.default.so` (built without a C library
+  of their own: they need nothing, or only the guest's own `libc.so`), the
+  class file archive `hello.jar` and the generated property area `guest.props`.
+
+QEMU is started from the application as a **separate process**
+(`ProcessBuilder`); they communicate over sockets, command-line arguments and
+files. No QEMU code is loaded into the application's process, and none of QEMU's
+source is used in these libraries — they are written from scratch on raw system
+calls and the system libraries listed above.
+
+`binderd` and the translator talk over a socket using the protocol declared in
+`qemu/src/binder_proto.h` (published under GPL-2.0-or-later); `binderd` contains
+no QEMU code and is not part of QEMU.
+
+---
+
+## 5. Guest firmware and anything installed inside it
+
+⚠️ **Not part of this package and not licensed here.**
+
+This application ships **no firmware at all**. The user supplies their own
+archive, and the application unpacks it on the device. Any firmware, and any
+application inside it, belongs to its own rights holder.
+
+Neither this repository nor the application provides links to download any
+firmware.
+
+You are responsible for having the right to use the firmware you supply, and to
+have a modified copy of it made on your own device. The application changes that
+copy (patched code, re-signed packages, removed vendor modules); nothing is sent
+anywhere. Package signatures of the copy are replaced with a key generated on
+your device.
+
+The application also runs a local TLS proxy: a root certificate generated on
+your device is added to the trust store of the copy, so that the firmware (which
+speaks only TLS 1.0) can reach the modern internet. The key never leaves the
+device.
+
+---
+
+## 6. Artwork
+
+The artwork in this application is either **drawn by its own code** or
+supplied by the project owner, and the package ships no photograph:
+
+* there is no handset frame: the guest screen is shown on its own, and under it
+  sits a key panel drawn by the application's code (`KeyPanel.kt`, package
+  `tech.istratii.senses.art`, laid out and painted by `Skin.kt`) — a plain
+  black strip with a "back" arrow and a "home" house outline drawn as strokes
+  and, between them, the lettering described in the next item. The two key
+  shapes are generic and are not taken from any other product; no image file
+  is involved;
+* the lettering between the on-screen keys ("SENSES"), the lettering in the
+  "about" window that opens when the phone is shaken while no system is
+  running ("ISTRATII_TECH"), and the launcher icon are vector drawings
+  supplied by the project owner: `art/logo_menu.svg`, `art/logo_about.svg`
+  and `art/icon.svg`. `tools/mkicon.py` reads the numbers from the drawings
+  and renders the letters, on the maintainer's computer, into coverage masks
+  (`res/drawable-nodpi/logo_menu_mask.png`, `logo_about_mask.png`) and into
+  the adaptive-icon layers (`res/mipmap-*/senses_fg.png`, and the white
+  themed-icon layer `senses_mono.png`); the colour
+  gradient and its animation are drawn on the device (`ShineLogo.kt`). The
+  drawings name a system typeface (`font-family`); the letters were
+  rasterised from the copy installed on the maintainer's computer, and **no
+  font file is stored in the repository or shipped in the package**. If the
+  mask fails to load, plain "SENSES" in the system typeface is drawn in its
+  place. The drawings carry no editor metadata.
+
+Earlier versions of this project surrounded the guest screen with a drawing of
+a handset, and before that with a photograph of one (the launcher icon was
+also made from it). All of that has been removed; none of it is in the tree or
+in the package.
+
+An interim launcher icon (and the plate between the keys) was cut from an
+AI-generated raster image; it was replaced by the owner's drawings above and
+its file (`art/icon.jpg`) is no longer in the tree.
+
+---
+
+## 7. Everything else
+
+The text of the GNU GPL version 2 is in `COPYING` at the root of this
+repository. The texts of the other licences are in `licenses/`:
+
+| file | covers |
+|---|---|
+| `licenses/Apache-2.0.txt` | Android Open Source Project headers (section 3); Kotlin standard library and JetBrains annotations (section 2.2) |
+| `licenses/BouncyCastle.txt` | Bouncy Castle (section 2.1) |
+| `licenses/LGPL-2.1.txt` | GLib and GNU gettext (section 1.3); the LGPL parts of QEMU |
+| `licenses/musl-COPYRIGHT.txt` | musl libc (section 1.3) |
+| `licenses/zlib.txt` | zlib (section 1.3) |
+| `licenses/QEMU-LICENSE.txt` | QEMU's statement on the licences of its files (section 1) |
+
+---
+
+## 8. Trademarks
+
+Android is a trademark of Google LLC.
+
+All other product names, logos and brands are property of their respective
+owners. This project is independent and is not affiliated with, endorsed by, or
+sponsored by any of them.

@@ -1,0 +1,102 @@
+Режим «init прошивки»: метки файлов — расширенный атрибут security.selinux (getxattr, lgetxattr, fgetxattr, setxattr, lsetxattr, fsetxattr, listxattr…) (метки — при GUEST_FWINIT=1 И GUEST_SELINUX=1 или GUEST_SELINUX_LABELS=1; user.* — всегда, у файла телефона, Р-112).
+
+Симптом. После патчей 0084–0086 init 5.0 на первых строках пишет «SELinux: Could
+not set context for /dev: Function not implemented» (и для /dev/socket,
+/dev/__properties__), а при запуске службы без seclabel не может посчитать её
+домен: getfilecon(исполняемого файла) падает, «could not get context while
+starting».
+
+Причина. В сборке транслятора нет libattr (CONFIG_ATTR не задан), поэтому ВСЕ
+вызовы расширенных атрибутов не имели обработчиков и отвечали ENOSYS.
+restorecon (lgetfilecon, lsetfilecon, getxattr security.restorecon_last) и init
+(getfilecon) читают и пишут security.selinux.
+
+Решение. Обработчики вне блока CONFIG_ATTR (#ifndef): все двенадцать вызовов
+идут в guest_selinux_xattr (qemu/src/guest_selinux.c). Для имени security.selinux:
+  * чтение (getxattr, lgetxattr, fgetxattr) существующего файла — «u:object_r:
+    unlabeled:s0» с нулём в конце (так у ядра отвечает файл без метки), а у ОБЫЧНОГО
+    ИСПОЛНЯЕМОГО файла прямо в /system/bin, /system/xbin, /sbin, /vendor/bin,
+    /system/vendor/bin — «u:object_r:<имя>_exec:s0» (так Android называет файлы
+    служб: vold → vold_exec; знаки вне [A-Za-z0-9_] — «_»): без состояния, по имени,
+    поэтому одинаково во всех процессах. Сквозь ссылку (getxattr) — по имени, под
+    которым вызвали; сама ссылка (lgetxattr) и fgetxattr (пути у описателя нет) —
+    unlabeled. Размер 0 — запрос длины; буфер мал — ERANGE (libselinux переспрашивает);
+    файла нет — ENOENT, плохой описатель — EBADF. Метка по имени нужна init: по ней он
+    считает домен службы без seclabel (патч 0085: …_exec → домен без суффикса), без неё
+    на каждую службу писал бы «needs a SELinux domain defined» и все службы получали
+    бы домен init;
+  * запись (setxattr, lsetxattr, fsetxattr) — успех, существование проверяется;
+  * listxattr, llistxattr, flistxattr — «security.selinux» (17 байт с нулём).
+security.restorecon_last: чтение — ENODATA (метки «последней переразметки» нет —
+restorecon обходит дерево целиком), запись — успех.
+
+★ Метки НЕ ХРАНЯТСЯ — решение и причина. Единственные читатели метки — restorecon
+(читает, сравнивает с тем, что дал file_contexts, и пишет; ему всё равно, что
+вернулось, лишь бы чтение не падало и не требовало повторов) и init при запуске
+службы (метка исполняемого файла нужна security_compute_create, а он у нас и так
+отвечает по типу цели). Хранить негде: у приложения Android нет права писать
+security.* настоящим файлам, user.* держат не все файловые системы телефона, а
+таблица в памяти не живёт дольше процесса и не общая между процессами. Цена —
+restorecon переписывает метку заново каждый раз.
+
+⚠️ Прочие имена атрибутов (trusted.*, system.*…) и removexattr/lremovexattr/fremovexattr
+для security.* — как прежде: ENOSYS. Без GUEST_FWINIT=1 или без GUEST_SELINUX=1 (и без
+GUEST_SELINUX_LABELS=1, Р-104) security.* — ENOSYS.
+★ Р-112: пространство user.* сюда НЕ относится — это обычные атрибуты, их транслятор
+пропускает к ХОЗЯЙСКОМУ файлу во всех режимах (тот же перевод пути, l* — без перехода
+по последней ссылке, f* — по описателю; ошибки хозяина — как есть), а listxattr
+отдаёт имена user.* файла плюс security.selinux при метках (guest_xattr.h). Подделка
+«запись — успех, чтение — ENODATA» (Р-104) заставляла installd 7.x переносить
+каталоги приложений на каждом подъёме: отметка user.default_crypto «пропадала».
+⚠️ Метку получает любой существующий путь, в том числе в /proc и /dev дерева.
+⚠️ Результат по размеру: размер 0 возвращает длину и не трогает буфер гостя; буфер
+гостя блокируется ровно на длину значения, а не на заявленный размер (огромный
+размер без памяти не даст EFAULT).
+
+Проверка: tests/qemu/selinux.sh, случаи «5» и «12»; на Маке — native/test/test_xattr.c
+(tools/checknative.sh).
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -14350,7 +14350,41 @@
+         ret = get_errno(readahead(arg1, arg2, arg3));
+ #endif
+         return ret;
++#endif
++#ifndef CONFIG_ATTR
++#ifdef TARGET_NR_setxattr
++    /*
++     * ★ Без libattr в сборке расширенные атрибуты отвечали ENOSYS. Все двенадцать
++     * вызовов — в guest_selinux.c: user.* — у файла телефона во всех режимах (Р-112),
++     * security.selinux — подражание метки (патч 0087, Р-104); прочие имена и
++     * security.* без меток — ENOSYS, как прежде.
++     */
++    case TARGET_NR_getxattr:
++        return guest_selinux_xattr(GX_GET, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_lgetxattr:
++        return guest_selinux_xattr(GX_LGET, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_fgetxattr:
++        return guest_selinux_xattr(GX_FGET, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_setxattr:
++        return guest_selinux_xattr(GX_SET, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_lsetxattr:
++        return guest_selinux_xattr(GX_LSET, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_fsetxattr:
++        return guest_selinux_xattr(GX_FSET, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_listxattr:
++        return guest_selinux_xattr(GX_LIST, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_llistxattr:
++        return guest_selinux_xattr(GX_LLIST, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_flistxattr:
++        return guest_selinux_xattr(GX_FLIST, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_removexattr:
++        return guest_selinux_xattr(GX_REMOVE, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_lremovexattr:
++        return guest_selinux_xattr(GX_LREMOVE, arg1, arg2, arg3, arg4, arg5);
++    case TARGET_NR_fremovexattr:
++        return guest_selinux_xattr(GX_FREMOVE, arg1, arg2, arg3, arg4, arg5);
+ #endif
++#endif /* !CONFIG_ATTR */
+ #ifdef CONFIG_ATTR
+ #ifdef TARGET_NR_setxattr
+     case TARGET_NR_listxattr:

@@ -1,0 +1,171 @@
+★★★★★ Общая папка: переводим САМИ, и наверх не пускаем.
+
+ЧТО БЫЛО СЛОМАНО. Приложение заводило папку на общем накопителе и клало в
+дерево пустой каталог `/mnt/sdcard`, а комментарий в Sdcard.kt обещал, что путь
+переводит транслятор. Не переводил: при переносе работы этот перевод не
+переехал, а номера патчей разошлись — под тем же номером оказался совсем другой
+патч (mount-never-syscall). Заметить
+это было нечем — гость исправно писал в `<корень>/storage/emulated/0` внутри
+песочницы, всё «работало», только человек снаружи к этой папке не дотягивался,
+а положенный им файл гость не видел.
+
+⚠️ Номера патчей у разных рабочих копий сталкиваются — об этом предупреждает и шапка
+qemu/build-android.sh. Поэтому здесь номер 0041, а не 0030.
+
+ПОЧЕМУ НЕ ССЫЛКОЙ. Ссылку в дереве ядро разыменовывает само, без всяких
+проверок, и `..` уводит гостя ВЫШЕ общей папки — во всё хранилище хозяина. У
+соседнего стенда это было проверено на телефоне: `ls /mnt/sdcard/..` показывал
+Pictures, Movies и прочее. Симлинком это не лечится в принципе.
+
+Поэтому путь собирается здесь, по кускам: `.` пропускается, `..` снимает
+последний кусок и НИКОГДА не поднимается выше корня общей папки.
+
+★ СПИСОК ИМЁН ШИРЕ, ЧЕМ У СОСЕДА. У 2.3 накопитель звался `/mnt/sdcard`, а
+4.4 обращается к нему четырьмя разными путями сразу, и достаточно пропустить
+один, чтобы половина прошивки писала мимо:
+
+    /mnt/sdcard            — старое имя, им пользуются старые приложения
+    /sdcard                — ссылка на живом устройстве
+    /storage/emulated/legacy — EXTERNAL_STORAGE у №2 (из её же init.rc)
+    /storage/emulated/0    — путь текущего пользователя
+    /storage/sdcard0       — как это зовут в режиме восстановления
+    /mnt/shell/emulated/0  — «источник» эмуляции, его видит adb и MediaScanner
+
+⚠️ Каталоги-вместилища (`/storage`, `/storage/emulated`, `/mnt/shell/emulated`)
+в список НЕ входят намеренно: переведи мы их, `/storage/emulated/0` стал бы
+`<папка>/0`. Их гость видит как есть — пустыми каталогами дерева, и это правда.
+
+⚠️ Утечки хозяйского хранилища тут не было и раньше: патч 0026 держит
+`/storage` в «своих ветвях гостя», поэтому неизвестный путь под ним уходит ПОД
+КОРЕНЬ, а не к хозяину. Проверено файлом-приметой на хранилище телефона —
+гость его не видит. Этот патч чинит другое: чтобы общая папка вообще
+доехала до гостя.
+
+Корень задаёт приложение переменной GUEST_SDCARD. Нет её — поведение прежнее.
+
+--- a/util/path.c
++++ b/util/path.c
+@@ -105,8 +105,84 @@
+     return false;
+ }
+ 
++/*
++ * ★★★ Общая папка: свой перевод пути. Подробности — в заголовке патча 0041.
++ */
++static const char *sdcard_base;
++
++/*
++ * ⚠️ Порядок ВАЖЕН: сначала длинные имена. Иначе `/storage/emulated/0` попало
++ * бы под правило для `/storage/emulated` (если его когда-нибудь добавят) и
++ * превратилось бы в «<папка>/0».
++ */
++static const char *const sdcard_names[] = {
++    "/storage/emulated/legacy",
++    "/mnt/shell/emulated/0",
++    "/storage/emulated/0",
++    "/storage/sdcard0",
++    "/mnt/sdcard",
++    "/sdcard",
++    NULL
++};
++
++static bool sdcard_prefix(const char *name, const char **rest)
++{
++    int i;
++
++    for (i = 0; sdcard_names[i]; i++) {
++        size_t n = strlen(sdcard_names[i]);
++
++        if (strncmp(name, sdcard_names[i], n) == 0 &&
++            (name[n] == '/' || name[n] == '\0')) {
++            *rest = name + n;
++            return true;
++        }
++    }
++    return false;
++}
++
++static char *sdcard_map(const char *rest)
++{
++    GString *out = g_string_new(sdcard_base);
++    size_t root = strlen(sdcard_base);
++    const char *p = rest;
++
++    while (*p) {
++        const char *seg;
++        size_t len;
++
++        while (*p == '/') {
++            p++;
++        }
++        if (!*p) {
++            break;
++        }
++        seg = p;
++        while (*p && *p != '/') {
++            p++;
++        }
++        len = p - seg;
++        if (len == 1 && seg[0] == '.') {
++            continue;
++        }
++        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
++            char *slash = strrchr(out->str + root, '/');
++
++            if (slash) {                      /* выше корня не поднимаемся */
++                g_string_truncate(out, slash - out->str);
++            }
++            continue;
++        }
++        g_string_append_c(out, '/');
++        g_string_append_len(out, seg, len);
++    }
++    return g_string_free(out, FALSE);
++}
++
+ void init_paths(const char *prefix)
+ {
++    sdcard_base = getenv("GUEST_SDCARD");
++
+     if (prefix[0] == '\0' || !strcmp(prefix, "/")) {
+         return;
+     }
+@@ -142,20 +252,28 @@
+         ret = value ? value : name;
+     } else {
+         char *save = g_strdup(name);
+-        char *full = g_build_filename(base, name, NULL);
++        const char *rest;
++        char *full;
+ 
+-        /* Look for the path; record the result, pass or fail.  */
+-        if (access(full, F_OK) == 0) {
+-            /* Exists.  */
+-            g_hash_table_insert(hash, save, full);
+-            ret = full;
+-        } else if (under_guest_write_root(name)) {
+-            /* Своя ветвь гостя: создавать надо ПОД КОРНЕМ, а не у хозяина. */
++        if (sdcard_base && sdcard_prefix(name, &rest)) {
++            /* ★ Общая папка — свой перевод, см. sdcard_map. */
++            full = sdcard_map(rest);
++        } else {
++            full = g_build_filename(base, name, NULL);
++            /*
++             * Есть под корнем — берём. Нет, но это своя ветвь гостя (патчи
++             * 0004 и 0026) — тоже берём: создавать надо ПОД КОРНЕМ, а не у
++             * хозяина. Иначе пусть идёт как есть.
++             */
++            if (access(full, F_OK) != 0 && !under_guest_write_root(name)) {
++                g_free(full);
++                full = NULL;
++            }
++        }
++        if (full) {
+             g_hash_table_insert(hash, save, full);
+             ret = full;
+         } else {
+-            /* Does not exist.  */
+-            g_free(full);
+             g_hash_table_insert(hash, save, NULL);
+             ret = name;
+         }

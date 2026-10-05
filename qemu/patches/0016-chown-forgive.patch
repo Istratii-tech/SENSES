@@ -1,0 +1,129 @@
+Смена владельца: отказ хозяина превращаем в успех, иначе installd сносит каталоги.
+
+Симптом. Ни у одного пакета прошивки нет каталога данных:
+
+  E installd        cannot chown dir '/data/data/com.android.settings': Operation not permitted
+  W PackageManager  Unable to create data directory: /data/data/com.vendor.app
+  E ActivityThread  Failed to find provider info for settings
+  E AndroidRuntime  *** FATAL EXCEPTION IN SYSTEM PROCESS: PowerManagerService
+  E AndroidRuntime  java.lang.NullPointerException
+        at android.content.ContentQueryMap.<init>(ContentQueryMap.java:65)
+        at com.android.server.PowerManagerService.initInThread(PowerManagerService.java:691)
+
+Причина. installd заводит каталог пакета так:
+
+  mkdir(pkgdir, 0751); chmod(pkgdir, 0751); chown(pkgdir, uid, gid);
+
+и на отказе ЛЮБОГО шага делает unlink(pkgdir) и возвращает ошибку. Мы не root,
+chown отдаёт EPERM — и каталог исчезает сразу после создания. Дальше по цепочке
+нет провайдера настроек, а без него PowerManagerService получает пустой курсор
+и роняет system_server.
+
+Смена владельца внутри гостя — его собственный учёт, ровно как uid процесса
+(патч 0010). Хозяйские файлы при этом остаются хозяйскими, и запрещённое
+песочнице остаётся запрещённым.
+
+⚠️ Настоящий владелец у файлов не меняется, и stat пока отдаёт правду. Там, где
+система СВЕРЯЕТ владельца (PackageManagerService сверяет владельца каталога
+данных с uid пакета), это будет видно — и лечиться отдельно.
+
+⚠️ Успехом отвечаем только на EPERM и EACCES. ENOENT и прочее — настоящие
+ошибки, и прятать их нельзя.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -161,6 +161,29 @@
+ #include "guest_binder.h"
+ #include "guest_ids.h"
+ #include "guest_net.h"
++
++/*
++ * ★ Отказ в смене владельца превращаем в успех.
++ *
++ * Мы не root, и chown у хозяина отдаёт EPERM. Гостю это смертельно: installd
++ * прошивки заводит каталог пакета как mkdir + chmod + chown и на отказе ЛЮБОГО
++ * шага делает unlink и возвращает ошибку — то есть каталоги данных ВСЕХ
++ * пакетов исчезали сразу после создания:
++ *
++ *   E installd        cannot chown dir '/data/data/com.android.settings': Operation not permitted
++ *   W PackageManager  Unable to create data directory: /data/data/com.vendor.app
++ *   E ActivityThread  Failed to find provider info for settings
++ *
++ * а без провайдера настроек system_server умирает в PowerManagerService.
++ * Подробности и оговорки — в linux-user/guest_ids.c.
++ */
++static abi_long guest_own(abi_long ret, const char *what)
++{
++    if (is_error(ret) && guest_ids_chown_forgive(errno, what)) {
++        return 0;
++    }
++    return ret;
++}
+ #include "user/syscall-trace.h"
+ #include "special-errno.h"
+ #include "qapi/error.h"
+@@ -12002,7 +12025,8 @@
+     case TARGET_NR_lchown:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(lchown(path(p), low2highuid(arg2), low2highgid(arg3)));
++        ret = guest_own(get_errno(lchown(path(p), low2highuid(arg2),
++                                       low2highgid(arg3))), "lchown");
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12086,13 +12110,14 @@
+             return guest_ids_setgroups(gidsetsize, grouplist);
+         }
+     case TARGET_NR_fchown:
+-        return get_errno(fchown(arg1, low2highuid(arg2), low2highgid(arg3)));
++        return guest_own(get_errno(fchown(arg1, low2highuid(arg2),
++                                        low2highgid(arg3))), "fchown");
+ #if defined(TARGET_NR_fchownat)
+     case TARGET_NR_fchownat:
+         if (!(p = lock_user_string(arg2))) 
+             return -TARGET_EFAULT;
+-        ret = get_errno(fchownat(arg1, path(p), low2highuid(arg3),
+-                                 low2highgid(arg4), arg5));
++        ret = guest_own(get_errno(fchownat(arg1, path(p), low2highuid(arg3),
++                                         low2highgid(arg4), arg5)), "fchownat");
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -12142,7 +12167,8 @@
+     case TARGET_NR_chown:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chown(path(p), low2highuid(arg2), low2highgid(arg3)));
++        ret = guest_own(get_errno(chown(path(p), low2highuid(arg2),
++                                      low2highgid(arg3))), "chown");
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12159,7 +12185,7 @@
+     case TARGET_NR_lchown32:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(lchown(path(p), arg2, arg3));
++        ret = guest_own(get_errno(lchown(path(p), arg2, arg3)), "lchown32");
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -12436,7 +12462,7 @@
+ #endif
+ #ifdef TARGET_NR_fchown32
+     case TARGET_NR_fchown32:
+-        return get_errno(fchown(arg1, arg2, arg3));
++        return guest_own(get_errno(fchown(arg1, arg2, arg3)), "fchown32");
+ #endif
+ #ifdef TARGET_NR_setresuid32
+     case TARGET_NR_setresuid32:
+@@ -12480,7 +12506,7 @@
+     case TARGET_NR_chown32:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chown(path(p), arg2, arg3));
++        ret = guest_own(get_errno(chown(path(p), arg2, arg3)), "chown32");
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif

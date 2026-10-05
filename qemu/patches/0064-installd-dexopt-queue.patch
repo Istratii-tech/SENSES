@@ -1,0 +1,125 @@
+Очередь перевода байткода у installd: процесс перевода — только со свободным гнездом.
+
+Симптом (регресс 24.09, Р-11, №3). Первая загрузка свежего дерева: пик 45
+процессов при стене хозяина 32, и 33 из них — dexopt. На первой загрузке
+разборщик пакетов этой прошивки зовёт Installer.asyncDexopt, а её installd
+на каждый пакет заводит поток и в нём fork + exec dexopt — без предела.
+Сколько окажется разом, решает нагрузка: 23.09 было 19, 24.09 — 33.
+
+Хозяин считает процессы, а не потоки. Поэтому очередь — ДО fork, в самом
+installd: поток ждёт свободного гнезда, и процесс перевода появляется только
+с ним. Гнездо — flock на файле forkslot.<k> без CLOEXEC: замок держит
+ребёнок через exec и до выхода, родитель свой описатель закрывает сразу
+после fork. Ребёнок умер — замок снят ядром, учёта с нашей стороны нет.
+
+Включается GUEST_FORK_SLOTS (сколько гнёзд) и GUEST_FORK_SLOT_DIR (где
+файлы); без них — прежнее поведение. У installd AOSP перевод по одному, и
+очередь там не ждёт никогда. Через 10 минут без гнезда идём без очереди:
+лишний процесс лучше вставшей установки.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -6926,6 +6926,81 @@
+ 
+ /* do_fork() Must return host values and target errnos (unlike most
+    do_*() functions). */
++/*
++ * ★★★★★ ОЧЕРЕДЬ ПЕРЕВОДА БАЙТКОДА У installd (регресс 24.09, Р-11).
++ *
++ * Первая загрузка свежего дерева №3 дала пик 45 процессов при стене хозяина
++ * 32, и 33 из них были `dexopt`: на первой загрузке разборщик пакетов этой
++ * прошивки зовёт `Installer.asyncDexopt`, а её `installd` на каждый пакет
++ * заводит поток и в нём `fork` + `exec dexopt` — без всякого предела. Сколько
++ * их окажется разом, решает нагрузка (23.09 было 19, 24.09 — 33).
++ *
++ * Потоки хозяин не считает, процессы — считает. Поэтому очередь — ДО fork, в
++ * самом `installd`: поток ждёт свободного гнезда, а процесс перевода
++ * появляется, только когда гнездо взято. Гнездо — `flock` на файле
++ * `forkslot.<k>` без CLOEXEC: замок держит ребёнок, через exec и до своего
++ * выхода, а родитель свой описатель закрывает сразу после fork. Ребёнок
++ * умер — замок снят ядром, и никакого учёта с нашей стороны не нужно.
++ *
++ * Включается переменными GUEST_FORK_SLOTS (сколько гнёзд) и
++ * GUEST_FORK_SLOT_DIR (где файлы); без них — прежнее поведение. У installd
++ * AOSP перевод по одному, и очередь там никогда не ждёт.
++ *
++ * ⚠️ Ждём не бесконечно: через 10 минут без гнезда идём без очереди —
++ * лучше лишний процесс, чем вставшая установка.
++ */
++static int fork_slot_take(void)
++{
++    static int slots = -1;
++    static const char *dir;
++    const char *b;
++    int waited = 0;
++
++    if (slots < 0) {
++        const char *n = getenv("GUEST_FORK_SLOTS");
++
++        dir = getenv("GUEST_FORK_SLOT_DIR");
++        slots = (n && dir && dir[0]) ? atoi(n) : 0;
++        if (slots > 32) {
++            slots = 32;
++        }
++    }
++    if (slots <= 0 || !exec_path) {
++        return -1;
++    }
++    b = strrchr(exec_path, '/');
++    if (strcmp(b ? b + 1 : exec_path, "installd") != 0) {
++        return -1;
++    }
++    for (;;) {
++        int k;
++
++        for (k = 0; k < slots; k++) {
++            char name[PATH_MAX];
++            int fd;
++
++            snprintf(name, sizeof name, "%s/forkslot.%d", dir, k);
++            fd = open(name, O_RDWR | O_CREAT, 0600);
++            if (fd < 0) {
++                return -1;              /* некуда класть гнёзда — без очереди */
++            }
++            if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
++                if (waited >= 10) {
++                    fprintf(stderr, "qemu: очередь installd: гнездо %d после %d мс ожидания\n",
++                            k, waited * 100);
++                }
++                return fd;
++            }
++            close(fd);
++        }
++        if (++waited > 6000) {
++            fprintf(stderr, "qemu: очередь installd: 10 минут без гнезда — иду без очереди\n");
++            return -1;
++        }
++        g_usleep(100 * 1000);
++    }
++}
++
+ static int do_fork(CPUArchState *env, unsigned int flags, abi_ulong newsp,
+                    abi_ulong parent_tidptr, target_ulong newtls,
+                    abi_ulong child_tidptr)
+@@ -7047,12 +7122,21 @@
+             return -TARGET_EINVAL;
+         }
+ 
++        /* ★ Очередь у installd — ДО fork (Р-11, см. fork_slot_take). */
++        int slot = fork_slot_take();
++
+         if (block_signals()) {
++            if (slot >= 0) {
++                close(slot);
++            }
+             return -QEMU_ERESTARTSYS;
+         }
+ 
+         fork_start();
+         ret = fork();
++        if (ret != 0 && slot >= 0) {
++            close(slot);            /* замок остался у ребёнка (или отказ fork) */
++        }
+         if (ret == 0) {
+             /* Child Process.  */
+             cpu_clone_regs_child(env, newsp, flags);

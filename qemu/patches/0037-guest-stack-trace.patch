@@ -1,0 +1,77 @@
+--- a/linux-user/signal.c	2026-09-06 21:47:23.588540011 +0300
++++ b/linux-user/signal.c	2026-09-06 21:47:23.616554011 +0300
+@@ -750,6 +750,32 @@
+  * лежат в АДРЕСНОМ ПРОСТРАНСТВЕ САМОГО qemu, поэтому /proc/self/maps даёт имя
+  * файла и смещение в нём. Дальше место находится обычным дизассемблером.
+  */
++/* Похож ли адрес на код: лежит в отображении файла с правом исполнения. */
++static int guest_addr_is_code(unsigned long a)
++{
++    FILE *m = fopen("/proc/self/maps", "r");
++    char line[512];
++    int yes = 0;
++
++    if (!m) {
++        return 0;
++    }
++    while (fgets(line, sizeof line, m)) {
++        unsigned long lo, hi;
++        char perm[8] = { 0 };
++
++        if (sscanf(line, "%lx-%lx %7s", &lo, &hi, perm) != 3) {
++            continue;
++        }
++        if (a >= lo && a < hi) {
++            yes = (perm[2] == 'x' || perm[0] == 'r') && strchr(line, '/') != NULL;
++            break;
++        }
++    }
++    fclose(m);
++    return yes;
++}
++
+ static void guest_addr_where(const char *tag, unsigned long a)
+ {
+     FILE *m = fopen("/proc/self/maps", "r");
+@@ -818,6 +844,41 @@
+     guest_addr_where("PC", (unsigned long)env->regs[15]);
+     guest_addr_where("LR", (unsigned long)env->regs[14]);
+ #endif
++#ifdef TARGET_ARM
++    /*
++     * ★★★ ОБРАТНЫЙ СЛЕД БЕДНЯКА.
++     *
++     * PC и LR говорят, ГДЕ упало, но не КТО привёл. У защиты стека это особенно
++     * обидно: «stack corruption detected» печатает libc, а переполнил буфер
++     * кто-то в нескольких кадрах ниже, и без следа его не найти — тел процессов
++     * в стенде нет, ptrace под трансляцией врёт.
++     *
++     * Кадровых указателей у Thumb-кода обычно нет, поэтому идём проще: читаем
++     * стек сверху вниз и печатаем те слова, что похожи на адрес возврата —
++     * попадают в отображённый файл с правом исполнения. Ложные срабатывания
++     * бывают, но список из десятка строк с именами библиотек сразу показывает
++     * дорогу вызова.
++     */
++    {
++        abi_ulong sp = env->regs[13];
++        int shown = 0;
++
++        fprintf(stderr, "qemu: след по стеку (сверху вниз):\n");
++        for (int i = 0; i < 256 && shown < 12; i++) {
++            abi_ulong w = 0;
++            if (get_user_u32(w, sp + (abi_ulong)(i * 4))) {
++                break;
++            }
++            if (w < 0x1000) {
++                continue;
++            }
++            if (guest_addr_is_code((unsigned long)(w & ~1u))) {
++                guest_addr_where("  возврат", (unsigned long)w);
++                shown++;
++            }
++        }
++    }
++#endif
+     fflush(stderr);
+ 
+     preexit_cleanup(env, 128 + target_sig);

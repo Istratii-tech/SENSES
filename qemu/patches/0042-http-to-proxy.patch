@@ -1,0 +1,16 @@
+--- a/linux-user/syscall.c	2026-09-02 11:53:54.676112052 +0300
++++ b/linux-user/syscall.c	2026-09-02 11:53:54.677112052 +0300
+@@ -3438,6 +3438,13 @@
+ 
+     addrlen = guest_unix_path(addr, addrlen, &unbuf);   /* см. do_bind выше */
+ 
++    /*
++     * ★ Соединение на порт 80 уводим посреднику приложения: гость сам не может
++     * ходить по https (его TLS 2010 года сайты не принимают), поэтому наружу
++     * ходим мы. Подробности и оговорки — в guest_net.c: guest_http_redirect.
++     */
++    guest_http_redirect(sockfd, addr, addrlen);
++
+     return get_errno(safe_connect(sockfd, addr, addrlen));
+ }
+ 

@@ -1,0 +1,95 @@
+Подставной netlink обязан отвечать на запросы дампа, иначе виснет весь веб.
+
+Симптом. Браузер прошивки открывается, адрес в строке правильный, полоса
+загрузки встаёт на ~35 % — и содержимое остаётся белым. НАВСЕГДА и для ЛЮБОЙ
+страницы, включая локальный file://. Ни падения, ни ругани в журнале.
+
+Разбор (14 сентября, снимок стека по SIGQUIT + /proc/<tid>/syscall):
+
+  "WebViewCoreThread" tid=14 NATIVE
+    at android.webkit.BrowserFrame.nativeCreateFrame(Native Method)
+    #03 base::ConditionVariable::Wait()          libbrowsernet.so
+    #05 base::WaitableEvent::Wait()
+    #06 base::Thread::StartWithOptions()
+    #07 net::NetworkChangeNotifierLinux::NetworkChangeNotifierLinux()
+    #08 net::NetworkChangeNotifier::Create()
+
+а созданный им поток — в хозяйском syscall 207 (recvfrom), fd 81, буфер 4096,
+wchan = __skb_wait_for_more_packets.
+
+То есть: движок браузера прошивки при создании КАЖДОЙ страницы поднимает у сетевой
+части движка наблюдателя за сетью; тот заводит поток; поток ПЕРЕД тем как
+отчитаться «я встал» просит дамп адресов через netlink и читает подряд, пока
+не придёт NLMSG_DONE. Ответа нет — поток не отчитывается — StartWithOptions
+стоит вечно — nativeCreateFrame не возвращается — страницы нет.
+
+Причина именно наша. Патчи 0014/0021 подставляют вместо запрещённого хозяином
+netlink безвредный AF_UNIX: netd прошивки без netlink не стартует, а без netd
+загрузка встаёт навсегда. Подставной сокет был НЕМЫМ — «чтение честно
+блокируется, событий у нас всё равно нет». Для netd это безобидно (его поток
+событий и должен спать), а для того, кто ЖДЁТ ответа на свой запрос, —
+смертельно.
+
+Лечение — в linux-user/guest_net.c: подставной сокет теперь пара, и на запросы с
+NLM_F_DUMP мы отвечаем сами (один поднятый интерфейс с адресом + NLMSG_DONE).
+Здесь только вызов.
+
+★ 14 сентября добавлено: вызов не просто помечает посылку, а ЗАБИРАЕТ сокет
+себе (guest_net_adopt), если он ещё настоящий. Хозяин разрешает приложению
+netlink создать и привязать, но не даёт послать, — и такой сокет проходил мимо
+подмены. У Оперы это выглядело так:
+
+  [ERROR:address_tracker_linux.cc(222)]
+      Could not send NETLINK request: Permission denied (13)
+
+⚠️ Отправку в подставной сокет всегда считаем удавшейся: настоящий netlink
+ответил бы успехом. Без этого гость получал бы ENOTCONN (send без адреса) или
+EINVAL (sendto с sockaddr_nl) — оба от AF_UNIX, и оба гостю непонятны.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3511,5 +3511,24 @@
+     if (send) {
+-        if (fd_trans_target_to_host_data(fd)) {
++        /*
++         * ★ Подставной netlink и здесь: посылку делают и через sendmsg, а не
++         * только через sendto. Без этого гость получил бы EINVAL от AF_UNIX
++         * (адрес-то sockaddr_nl) и остался бы без ответа — то есть повис бы
++         * на чтении ровно так же.
++         */
++        guest_net_adopt(fd, vec && count ? vec[0].iov_base : NULL,
++                          vec && count ? vec[0].iov_len : 0);
++        if (guest_net_owns(fd)) {
++            abi_long total = 0;
++            abi_ulong i;
++
++            for (i = 0; vec && i < count; i++) {
++                total += vec[i].iov_len;
++            }
++            if (vec && count) {
++                guest_net_answer(fd, vec[0].iov_base, vec[0].iov_len);
++            }
++            ret = total;
++        } else if (fd_trans_target_to_host_data(fd)) {
+             void *host_msg;
+ 
+             host_msg = g_malloc(msg.msg_iov->iov_len);
+@@ -3773,6 +3773,18 @@
+     host_msg = lock_user(VERIFY_READ, msg, len, 1);
+     if (!host_msg)
+         return -TARGET_EFAULT;
++    /*
++     * ★★★★★ Подставной netlink: гость шлёт запрос и ждёт ответа. Отвечаем
++     * сами — иначе его чтение не кончится никогда (см. guest_net.c). Отправку
++     * считаем удавшейся целиком: настоящий netlink ответил бы так же, а
++     * настоящего под нами нет.
++     */
++    guest_net_adopt(fd, host_msg, len);
++    if (guest_net_owns(fd)) {
++        guest_net_answer(fd, host_msg, len);
++        unlock_user(host_msg, msg, 0);
++        return (abi_long)len;
++    }
+     if (fd_trans_target_to_host_data(fd)) {
+         copy_msg = host_msg;
+         host_msg = g_malloc(len);

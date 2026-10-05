@@ -1,0 +1,70 @@
+Гость видит личность системы (root), а не приложения.
+
+Прошивка — системный образ: её службы объявляются в binder, а servicemanager
+пускает туда только root и AID_SYSTEM (svc_can_register в его binder.c). Наши
+гостевые процессы наследовали uid приложения, и SurfaceFlinger получал отказ на
+регистрацию. Снаружи это выглядело обманчиво: SF работает, графику
+инициализировал, в демоне видно «диспетчер: код=3 имя SurfaceFlinger» — а
+bootanimation бесконечно пишет «Waiting for service SurfaceFlinger...».
+
+Теперь getuid/geteuid/getgid/getegid отдают гостю то, что задано в GUEST_UID и
+GUEST_GID (по умолчанию 0). Права ХОЗЯИНА при этом не меняются ни на байт:
+запрещённое песочнице остаётся запрещённым, гость лишь видит ожидаемые номера.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -159,6 +159,7 @@
+ #include "qemu/guest-random.h"
+ #include "qemu/selfmap.h"
+ #include "guest_binder.h"
++#include "guest_ids.h"
+ #include "user/syscall-trace.h"
+ #include "special-errno.h"
+ #include "qapi/error.h"
+@@ -11806,7 +11807,7 @@
+ #endif
+ #ifdef TARGET_NR_getuid
+     case TARGET_NR_getuid:
+-        return get_errno(high2lowuid(getuid()));
++        return high2lowuid(guest_guest_uid());    /* см. getuid32 ниже */
+ #endif
+ #ifdef TARGET_NR_getgid
+     case TARGET_NR_getgid:
+@@ -11961,7 +11962,17 @@
+ #endif
+ #ifdef TARGET_NR_getuid32
+     case TARGET_NR_getuid32:
+-        return get_errno(getuid());
++        /*
++         * ★ Личность ГОСТЯ, а не хозяина. Прошивка — системный образ: её службы
++         * объявляются в binder, а servicemanager пускает туда только root и
++         * system. С uid приложения SurfaceFlinger получал отказ, и снаружи это
++         * выглядело как «bootanimation ждёт службу SurfaceFlinger», хотя SF
++         * работал. Настройка — GUEST_UID/GUEST_GID, см. linux-user/guest_ids.c.
++         *
++         * ⚠️ Права хозяина не меняются: запрещённое песочнице остаётся
++         * запрещённым, гость лишь видит ожидаемые номера.
++         */
++        return guest_guest_uid();
+ #endif
+ 
+ #if defined(TARGET_NR_getxuid) && defined(TARGET_ALPHA)
+@@ -12141,15 +12152,15 @@
+ 
+ #ifdef TARGET_NR_getgid32
+     case TARGET_NR_getgid32:
+-        return get_errno(getgid());
++        return guest_guest_gid();                 /* см. getuid32 выше */
+ #endif
+ #ifdef TARGET_NR_geteuid32
+     case TARGET_NR_geteuid32:
+-        return get_errno(geteuid());
++        return guest_guest_uid();                 /* см. getuid32 выше */
+ #endif
+ #ifdef TARGET_NR_getegid32
+     case TARGET_NR_getegid32:
+-        return get_errno(getegid());
++        return guest_guest_gid();                 /* см. getuid32 выше */
+ #endif
+ #ifdef TARGET_NR_setreuid32
+     case TARGET_NR_setreuid32:

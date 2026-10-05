@@ -1,0 +1,45 @@
+Ответ на запрос имени должен приходить «от того сервера», которого спрашивали.
+
+Симптом. Разрешения имён в госте нет вовсе, хотя наш ответчик отвечает:
+
+  E VendorService     cause=[java.net.UnknownHostException: Unable to resolve
+      host "dm.vendor.example": No address associated with hostname]
+
+а в журнале стенда на то же самое имя — десятки строк подряд:
+
+  имя dm.vendor.example: 127.1.0.8
+  имя dm.vendor.example: 127.1.0.8
+  … (и так пока резолвер не сдастся)
+
+Причина. Резолвер bionic сверяет ОТПРАВИТЕЛЯ ответа со списком своих серверов:
+
+  res_send.c, send_dg():
+    resplen = recvfrom(s, ans, anssiz, 0, (struct sockaddr *)&from, &fromlen);
+    …
+    if (!(statp->options & RES_INSECURE1) &&
+        !res_ourserver_p(statp, (struct sockaddr *)&from))
+            goto retry;      /* ответ выброшен, спрашиваем снова */
+
+Гость спрашивает 8.8.8.8:53 (мы сами прописали это в net.dns1), патч 0043
+уводит запрос на наш ответчик 127.0.0.1:18053 — и ответ, честно пришедший
+оттуда, «не от того сервера». Отсюда и цикл повторов, и итоговое «нет адреса».
+
+Лечение. Запоминаем, куда гость целился (только порт 53), и при приёме
+подставляем этот адрес обратно: спросил 8.8.8.8:53 — ответил 8.8.8.8:53. Код —
+в linux-user/guest_net.c (dns_remember / guest_dns_unredirect), здесь только вызов.
+
+⚠️ Только recvfrom: именно им резолвер и читает ответ.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3887,4 +3887,10 @@
+         if (target_addr) {
++            /*
++             * ★ Ответ нашего ответчика имён выдаём «от того сервера», которого
++             * гость спрашивал: иначе резолвер bionic его выбросит
++             * (см. guest_net.c).
++             */
++            guest_dns_unredirect(fd, addr, MIN(addrlen, ret_addrlen));
+             host_to_target_sockaddr(target_addr, addr,
+                                     MIN(addrlen, ret_addrlen));
+             if (put_user_u32(ret_addrlen, target_addrlen)) {

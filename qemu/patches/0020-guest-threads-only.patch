@@ -1,0 +1,113 @@
+Гость видит в /proc/self/task только СВОИ потоки.
+
+★★★ Симптом. Зигота 4.1 поднимается до конца предзагрузки, а system_server не
+запускается — и в логе НИ ОДНОЙ строки об ошибке:
+
+  Zygote  ...preloaded 2281 classes in 868ms.
+  Zygote  Preload resources disabled, skipped.
+  dalvikvm GC_EXPLICIT freed <1K, 32% free 2279K/3331K …      ← и тишина
+
+Процесс зиготы при этом жив и жжёт процессор. Трассировка показывает вечный
+круг:
+
+  open("/proc/self/task",O_RDONLY|O_DIRECTORY) = 27
+  getdents64(27,…) = 96        ← «.», «..» и ДВА потока
+  close(27)
+  futex(…,FUTEX_WAIT,…,{tv_nsec = 9921302}) = ETIMEDOUT       ← сон 10 мс
+
+Причина. Перед fork() Dalvik ждёт, пока в процессе не останется ровно один
+поток, и считает их по каталогу /proc/self/task. Свои потоки он к этому времени
+уже погасил (в трассировке видно освобождение их стёков: munmap(…,16384)), но в
+каталоге остаётся второй — служебный поток САМОЙ ТРАНСЛЯЦИИ (qemu поднимает
+поток RCU). Гость его не создавал и погасить не может, поэтому ждёт вечно.
+
+⚠️ Подменой пути (`-L <корень>`) это не лечится: qemu раскрывает путь через
+realpath ДО подстановки, и «/proc/self/task» превращается в «/proc/<pid>/task»
+— такого каталога в дереве нет, номер процесса заранее неизвестен. Проверено:
+каталог `<корень>/proc/self/task` с одной записью гость не видит вовсе.
+
+Решение. При выдаче содержимого каталога /proc/<наш pid>/task вычёркиваем
+записи, чей номер не принадлежит ни одному гостевому процессору. Записи «.» и
+«..» остаются; файлы внутри (/proc/self/task/<tid>/stat и прочие) не
+затрагиваются — их гость читает у хозяина как раньше.
+
+★ Это восстановление правды, а не обман: гостю показывается ровно то, что он
+сам породил. Потоки трансляции — часть нашей реализации.
+
+Код — в linux-user/guest_proc.c, там же оговорки.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -161,6 +161,7 @@
+ #include "guest_binder.h"
+ #include "guest_ids.h"
+ #include "guest_net.h"
++#include "guest_proc.h"
+ #include "guest_fs.h"
+ 
+ /*
+@@ -8688,10 +8689,23 @@
+ 
+     flags = guest_log_open_flags(pathname, flags);
+ 
+-    if (safe) {
+-        return safe_openat(dirfd, path(pathname), flags, mode);
+-    } else {
+-        return openat(dirfd, path(pathname), flags, mode);
++    {
++        int ofd;
++
++        if (safe) {
++            ofd = safe_openat(dirfd, path(pathname), flags, mode);
++        } else {
++            ofd = openat(dirfd, path(pathname), flags, mode);
++        }
++        /*
++         * ★ Открыли каталог потоков процесса? Запомним дескриптор: из его
++         * содержимого надо будет вычеркнуть потоки самой трансляции, иначе
++         * зигота 4.1 ждёт их завершения вечно (см. linux-user/guest_proc.c).
++         */
++        if (ofd >= 0) {
++            guest_proc_open(pathname, ofd);
++        }
++        return ofd;
+     }
+ }
+ 
+@@ -9096,6 +9110,18 @@
+         treclen = offsetof(struct target_dirent64, d_name) + namelen;
+         treclen = QEMU_ALIGN_UP(treclen, __alignof(struct target_dirent64));
+ 
++        /*
++         * ★ Потоки самой трансляции гостю не показываем: он их не создавал, а
++         * увидев — ждёт их завершения (зигота 4.1 перед fork() считает потоки
++         * по /proc/self/task). Запись просто не переносится в гостевой буфер:
++         * hreclen уже взят, treclen обнуляем, чтобы toff не сдвинулся.
++         */
++        if (guest_proc_hide_dent(dirfd, hde->d_name)) {
++            prev_diroff = hde->d_off;
++            treclen = 0;
++            continue;
++        }
++
+         if (toff + treclen > count) {
+             /*
+              * If the host struct is smaller than the target struct, or
+@@ -9468,6 +9494,7 @@
+          * смерти тем, кто их просил. */
+         guest_binder_close(arg1);
+         guest_net_close(arg1);
++        guest_proc_close(arg1);
+         fd_trans_unregister(arg1);
+         return get_errno(close(arg1));
+ #if defined(__NR_close_range) && defined(TARGET_NR_close_range)
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -15,6 +15,7 @@
+   'guest_ids.c',
+   'guest_input.c',
+   'guest_net.c',
++  'guest_proc.c',
+   'guest_tls.c',
+   'elfload.c',
+   'exit.c',

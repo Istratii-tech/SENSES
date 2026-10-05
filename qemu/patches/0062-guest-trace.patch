@@ -1,0 +1,50 @@
+Трасса гостя: отметки atrace прошивки и наши на одной шкале времени хозяина.
+
+Прошивка пишет свои отметки («B|pid|имя» / «E») в
+/sys/kernel/debug/tracing/trace_marker, а время и поток к ним добавляет ядро.
+Ядра у гостя нет, поэтому путь перехватывается (guest_binder_try_open →
+guest_trace_try_open): гостю отдаётся /dev/null с переводчиком записи
+fd_trans, а тот ставит время CLOCK_MONOTONIC, pid и tid сам и кладёт строку в
+trace.txt рядом с журналом шима binder. Туда же пишут шим binder и гостевая
+половина моста GL. Нет файла — не пишется ничего.
+
+Нужна, чтобы найти, какое звено держит кадр стола пальцем (книга 3.4.9, 9.29).
+
+⚠️★★ Переводчик ставится ПОСЛЕ открытия, а не внутри него. Ветки open и
+openat сразу за do_guest_openat зовут fd_trans_unregister(ret): новый описатель
+не должен унаследовать переводчик прежнего с тем же номером. Первая сборка
+регистрировала его внутри перехвата открытия — и qemu тут же его снимал:
+прошивка и мост писали в голый /dev/null, в трассе были одни отметки шима
+binder (он пишет в файл сам). Поэтому здесь две строки guest_trace_opened —
+после снятия.
+
+Код — в linux-user/guest_trace.c.
+
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -17,6 +17,7 @@
+   'guest_net.c',
+   'guest_pagelog.c',
+   'guest_proc.c',
++  'guest_trace.c',
+   'guest_tls.c',
+   'elfload.c',
+   'exit.c',
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -10132,6 +10132,7 @@
+                                   target_to_host_bitmask(arg2, fcntl_flags_tbl),
+                                   arg3, true));
+         fd_trans_unregister(ret);
++        guest_trace_opened(p, ret);
+         unlock_user(p, arg1, 0);
+         return ret;
+ #endif
+@@ -10142,6 +10143,7 @@
+                                   target_to_host_bitmask(arg3, fcntl_flags_tbl),
+                                   arg4, true));
+         fd_trans_unregister(ret);
++        guest_trace_opened(p, ret);
+         unlock_user(p, arg2, 0);
+         return ret;
+ #if defined(TARGET_NR_name_to_handle_at) && defined(CONFIG_OPEN_BY_HANDLE)

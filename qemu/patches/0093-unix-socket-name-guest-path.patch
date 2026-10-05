@@ -1,0 +1,126 @@
+Имя сокета UNIX — гостю гостевым путём: getsockname, getpeername, accept.
+
+Симптом (05.10, №16 — 7.1.1, «план»). Зигота 7.x умирает на первом ветвлении:
+
+  E Zygote: Socket name not whitelisted : /data/user/0/<пакет>/files/roots/20/dev/socket/zygote (fd=3)
+  F art: … com_android_internal_os_Zygote.cpp:467: Unable to construct file descriptor table.
+
+Причина. С 7.0 зигота перед ветвлением обходит свои описатели и сверяет имя
+каждого сокета UNIX (getsockname) с белым списком: `/dev/socket/zygote`,
+`/dev/socket/zygote_secondary`. Сокеты служб гостя стенд заводит у себя, под
+корнем дерева; путь при bind и connect уводится под корень (0063), а ответы
+getsockname, getpeername и accept отдавали гостю хозяйский путь как есть.
+
+Теперь путь под корнем дерева или общей папкой переводится обратно тем же
+path_to_guest, что и цели ссылок (0063, 0068). Безымянные и абстрактные
+адреса — как были. Буфер к ядру — не меньше sockaddr_storage: хозяйский путь
+длиннее гостевого, и в буфере гостя он обрезался бы до перевода (так же, как
+у readlink в 0065). Длина ответа — как у ядра: семейство, путь, ноль.
+
+⚠️ Граница (проверка r100, мелкое 5). Имя отправителя у recvfrom и recvmsg
+(msg_name, датаграммы AF_UNIX) не переводится — хозяйский путь, как прежде;
+так же пути сокетов вне дерева и общей папки (демоны стенда в его доме): их
+гость получает как есть. Случая, где прошивка на этом встала бы, пока не
+видели; понадобится — тот же unix_name_to_guest в do_recvfrom и
+do_sendrecvmsg_locked, а путь в доме стенда — как у readlink (0068).
+
+Проверка: tests/qemu/guestview.sh (группа 2); на Маке — unix_name_to_guest по
+тексту этого патча, native/test/test_standview.py.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3725,7 +3725,47 @@
+     }
+     return ret;
+ }
++
++/*
++ * ★ Патч 0093: имя сокета UNIX гостю — гостевым путём.
++ *
++ * Сокеты служб гостя (`/dev/socket/zygote` и прочие) стенд заводит у себя:
++ * хозяин видит их под корнем дерева, `<корень>/dev/socket/zygote`. Путь при
++ * bind и connect уводится под корень (патч 0063), а ответы getsockname,
++ * getpeername и accept отдавали гостю ХОЗЯЙСКИЙ путь как есть. Зигота 7.x
++ * перед ветвлением сверяет имена всех своих сокетов с белым списком
++ * (`/dev/socket/zygote`…) и на хозяйском имени умирает целиком:
++ *   E Zygote: Socket name not whitelisted : <корень>/dev/socket/zygote (fd=3)
++ *   F art: … Zygote.cpp:467: Unable to construct file descriptor table.
++ * Теперь путь под корнем дерева (или общей папкой) переводится обратно тем
++ * же path_to_guest, что и цели ссылок; безымянные и абстрактные — как были.
++ * Длина — как у ядра: семейство, путь и завершающий ноль.
++ */
++static socklen_t unix_name_to_guest(void *addr, socklen_t len)
++{
++    struct sockaddr_un *un = addr;
++    size_t off = offsetof(struct sockaddr_un, sun_path);
++    char host[sizeof(un->sun_path) + 1];
++    char *g;
++    size_t n;
+ 
++    if (len <= off || un->sun_family != AF_UNIX || un->sun_path[0] == '\0') {
++        return len;
++    }
++    n = MIN(len - off, sizeof(un->sun_path));
++    memcpy(host, un->sun_path, n);
++    host[n] = '\0';
++    g = path_to_guest(host);
++    if (!g) {
++        return len;
++    }
++    n = MIN(strlen(g), sizeof(un->sun_path) - 1);
++    memcpy(un->sun_path, g, n);
++    un->sun_path[n] = '\0';
++    g_free(g);
++    return off + n + 1;
++}
++
+ /* do_accept4() Must return target values and target errnos. */
+ static abi_long do_accept4(int fd, abi_ulong target_addr,
+                            abi_ulong target_addrlen_addr, int flags)
+@@ -3765,11 +3805,12 @@
+         return -TARGET_EFAULT;
+     }
+ 
+-    addr = alloca(addrlen);
++    addr = alloca(MAX(addrlen, sizeof(struct sockaddr_storage)));   /* патч 0093 */
+ 
+-    ret_addrlen = addrlen;
++    ret_addrlen = MAX(addrlen, sizeof(struct sockaddr_storage));
+     ret = get_errno(safe_accept4(fd, addr, &ret_addrlen, host_flags));
+     if (!is_error(ret)) {
++        ret_addrlen = unix_name_to_guest(addr, ret_addrlen);       /* патч 0093 */
+         guest_fwinit_prop_accepted(fd, ret);        /* патч 0080 */
+         host_to_target_sockaddr(target_addr, addr, MIN(addrlen, ret_addrlen));
+         if (put_user_u32(ret_addrlen, target_addrlen_addr)) {
+@@ -3798,11 +3839,12 @@
+         return -TARGET_EFAULT;
+     }
+ 
+-    addr = alloca(addrlen);
++    addr = alloca(MAX(addrlen, sizeof(struct sockaddr_storage)));   /* патч 0093 */
+ 
+-    ret_addrlen = addrlen;
++    ret_addrlen = MAX(addrlen, sizeof(struct sockaddr_storage));
+     ret = get_errno(getpeername(fd, addr, &ret_addrlen));
+     if (!is_error(ret)) {
++        ret_addrlen = unix_name_to_guest(addr, ret_addrlen);       /* патч 0093 */
+         host_to_target_sockaddr(target_addr, addr, MIN(addrlen, ret_addrlen));
+         if (put_user_u32(ret_addrlen, target_addrlen_addr)) {
+             ret = -TARGET_EFAULT;
+@@ -3830,10 +3872,13 @@
+         return -TARGET_EFAULT;
+     }
+ 
+-    addr = alloca(addrlen);
+-
+-    ret_addrlen = addrlen;
++    addr = alloca(MAX(addrlen, sizeof(struct sockaddr_storage)));   /* патч 0093 */
++
++    ret_addrlen = MAX(addrlen, sizeof(struct sockaddr_storage));
+     ret = get_errno(getsockname(fd, addr, &ret_addrlen));
++    if (!is_error(ret)) {
++        ret_addrlen = unix_name_to_guest(addr, ret_addrlen);       /* патч 0093 */
++    }
+     /*
+      * ★ Подставной netlink обязан называться netlink'ом: за дескриптором у нас
+      * AF_UNIX, а `ip` прошивки сверяет семейство и длину сразу после bind и

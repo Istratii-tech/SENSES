@@ -1,0 +1,120 @@
+Как ушёл процесс гостя — сам или от сигнала: строка в журнал стенда.
+
+Симптом (регресс 25.09, Р-35). На каждой загрузке одной из прошивок летопись
+стенда писала три «процесс гостя умер [ActivityManager]» — «Process <имя>
+(pid N) has died» без падения, без сигнала и без строки о снятии. Разбор по
+байткоду: приёмник прошивки в своём процессе запускает службу и сам зовёт
+System.exit(0). Выход по своей воле летопись от смерти не отличала — кода
+выхода диспетчер активностей не знает, а зигота пишет только ненулевой.
+
+Знает точно только транслятор. Выход гостя идёт через exit/exit_group (там
+уже зовётся preexit_cleanup с кодом), выход от сигнала — через
+dump_core_and_abort, который теперь выставляет guest_exit_signal перед тем
+же preexit_cleanup. preexit_cleanup дописывает строку
+
+  <время, мс> <pid> код|сигнал <число> <имя потока>
+
+в файл из GUEST_EXIT_LOG (его путь кладёт стенд, как GUEST_NET_LOG), а
+летопись сверяет её по pid со строкой «has died». SIGKILL сюда не доходит —
+его исполняет ядро без нас, — поэтому «записи нет» и значит «убит снаружи».
+
+Файл открывается на каждый выход с дозаписью (процессы гостя — форки, общий
+описатель через fork держать нельзя); строка короче PIPE_BUF и пишется одним
+write. Без GUEST_EXIT_LOG ничего не пишется.
+
+--- a/linux-user/exit.c
++++ b/linux-user/exit.c
+@@ -22,16 +22,71 @@
+ #include "qemu.h"
+ #include "user-internals.h"
+ #include "qemu/plugin.h"
++#include <sys/prctl.h>
+ 
+ #ifdef CONFIG_GCOV
+ extern void __gcov_dump(void);
+ #endif
+ 
++/*
++ * ★ КАК ПРОЦЕСС ГОСТЯ УШЁЛ — сам или от сигнала (регресс 25.09, Р-35).
++ *
++ * Диспетчер активностей о смерти процесса пишет одно и то же — «Process …
++ * (pid N) has died», — ушёл ли тот сам (`System.exit(0)` у приёмника,
++ * закончившего работу) или его убили. Кода выхода диспетчер не знает, а
++ * зигота пишет только ненулевой. Летопись стенда звала смертью и выход по
++ * своей воле: у одной прошивки — трижды за каждую загрузку.
++ *
++ * Знает точно только транслятор: выход идёт через exit/exit_group, а выход от
++ * сигнала — через dump_core_and_abort, который выставляет guest_exit_signal.
++ * Пишем одну строку «время_мс pid код|сигнал число имя» в файл из
++ * GUEST_EXIT_LOG (его кладёт стенд); строку сверяет с «has died» летопись.
++ *
++ * ⚠️ SIGKILL сюда не доходит никогда — его ядро исполняет без нас. Поэтому
++ * «записи нет» значит «убит снаружи», и это как раз смерть.
++ * ⚠️ Файл открывается на каждый выход, с дозаписью: процессы гостя —
++ * форки, и держать общий описатель через fork нельзя. Строка короче
++ * PIPE_BUF и пишется одним write — строки разных процессов не смешиваются.
++ */
++int guest_exit_signal;
++
++static void guest_exit_note(int code)
++{
++    const char *path = getenv("GUEST_EXIT_LOG");
++    char name[17] = "";
++    char line[128];
++    struct timespec ts;
++    int fd, n;
++
++    if (!path || !*path) {
++        return;
++    }
++    fd = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0600);
++    if (fd < 0) {
++        return;
++    }
++    clock_gettime(CLOCK_REALTIME, &ts);
++    prctl(PR_GET_NAME, (unsigned long)name, 0, 0, 0);
++    n = snprintf(line, sizeof line, "%lld %d %s %d %s\n",
++                 (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000,
++                 (int)getpid(),
++                 guest_exit_signal ? "сигнал" : "код",
++                 guest_exit_signal ? guest_exit_signal : (code & 0xff),
++                 name);
++    if (n > 0 && n < (int)sizeof line) {
++        if (write(fd, line, n) < 0) {
++            /* журнал — подсказка летописи, выходу он не помеха */
++        }
++    }
++    close(fd);
++}
++
+ void preexit_cleanup(CPUArchState *env, int code)
+ {
+ #ifdef CONFIG_GCOV
+         __gcov_dump();
+ #endif
++        guest_exit_note(code);
+         gdb_exit(code);
+         qemu_plugin_user_exit();
+         perf_exit();
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -988,6 +988,8 @@
+ #endif
+     fflush(stderr);
+ 
++    /* ★ Р-35: летописи — «ушёл от сигнала», а не «вышел сам» (exit.c). */
++    guest_exit_signal = target_sig;
+     preexit_cleanup(env, 128 + target_sig);
+     die_with_signal(host_sig);
+ }
+--- a/linux-user/user-internals.h
++++ b/linux-user/user-internals.h
+@@ -183,6 +183,8 @@
+  * code: the exit code
+  */
+ void preexit_cleanup(CPUArchState *env, int code);
++/* Сигнал, от которого уходит гость (0 — вышел сам); см. exit.c. */
++extern int guest_exit_signal;
+ 
+ /*
+  * Include target-specific struct and function definitions;

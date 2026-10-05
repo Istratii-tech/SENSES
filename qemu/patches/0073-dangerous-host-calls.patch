@@ -1,0 +1,257 @@
+Опасные для песочницы вызовы: хозяину НЕ отдаём — фильтр seccomp убивает процесс.
+
+★★★ Продолжение 0030 (mount) и 0072 (umount) на остальные вызовы из чёрного
+списка песочницы приложения Android. Ключ у этих свой: GUEST_HOSTCALL_REAL.
+
+Откуда список. AOSP bionic, libc/SECCOMP_BLACKLIST_APP.TXT и
+SECCOMP_BLACKLIST_COMMON.TXT (android-9.0.0_r1; с 12 файлы называются
+BLOCKLIST; состав тот же, кроме setregid — добавлен в 10 — и 32-битных
+setfsuid и setfsgid — добавлены в 14). Политика песочницы: разрешено всё из
+SYSCALLS.TXT, кроме этого списка, плюс белый список; остальное убивается. В
+Android 8.x в списке были только swapon и swapoff — mount и umount2 стали
+смертельными с 9.
+
+Симптом всех этих вызовов один: ядро убивает процесс прямо в вызове, сигналом
+SIGSYS (код выхода 159), возврата нет, в журнале ни строки. Убивается тот
+процесс гостя, что вызвал: у system_server это падение всей системы.
+
+Что стало. Хозяин не зовётся вовсе; гость получает:
+
+  clock_settime, clock_settime64, settimeofday   0
+  sethostname, setdomainname                     0
+  adjtimex, clock_adjtime, clock_adjtime64       EPERM
+  reboot                                         EPERM
+  chroot, swapon, swapoff, acct                  EPERM
+  syslog (klogctl):
+    READ(2), READ_ALL(3), READ_CLEAR(4)          0   (пустой буфер, гостю
+                                                      ничего не пишем)
+    CLEAR(5), SIZE_UNREAD(9), SIZE_BUFFER(10)    0
+    CLOSE(0), OPEN(1), CONSOLE_OFF/ON/LEVEL(6-8) EPERM
+    всё прочее                                   EINVAL, как прежде
+
+⚠️ Почему 0 у времени и имени узла. Время гостя и так идёт от хозяина (часы
+одни), а имя узла у гостя своё (патч 0061). Отказ дал бы только повторы: NTP и
+NITZ пробуют снова и снова, а system_server, у которого вызов шёл по пути
+SystemClock.setCurrentTimeMillis, считал бы это ошибкой.
+
+⚠️ Почему EPERM у остальных. Так ядро отвечает не root'у. У reboot, swapon,
+swapoff и acct проверка прав в ядре — первая, до разбора доводов, поэтому
+обычный пользователь получал бы ровно EPERM.
+⚠️ Протокол «гость просит перезагрузку» (завершить стенд особым кодом) — отдельное
+решение, позже; пока reboot просто отказывает.
+
+⚠️ Что остаётся прежним: указатели у sethostname, setdomainname, settimeofday,
+clock_settime проверяются как раньше (EFAULT). У вызовов с EPERM доводы не
+читаются вовсе — как у ядра, где права проверяются раньше.
+
+⚠️ На обычном Linux этого не видно: seccomp'а там нет, и хозяин отвечает по
+правам (EPERM у обычного пользователя). Под root вызовы опасны вдвойне: время,
+имя узла, swap и reboot хозяина менялись бы по просьбе гостя, а chroot и acct
+получали бы ГОСТЕВОЙ путь без подстановки корня.
+
+GUEST_HOSTCALL_REAL=1 возвращает настоящие вызовы — для отладки там, где
+seccomp не мешает. На телефоне и в AVD включать НЕЛЬЗЯ: убьёт процесс.
+
+Проверка: tests/qemu/hostcalls.sh — каждый вызов гостевая программа делает
+под фильтром seccomp, который убивает хозяйский вызов так же, как песочница
+(tests/qemu/sandbox.c).
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -10337,6 +10337,19 @@
+            int, __to_dfd, const char *, __to_pathname, unsigned int, flag)
+ #endif
+ 
++/*
++ * ★★★ Хозяйские вызовы, которые фильтр seccomp песочницы приложения Android
++ * убивает (патч 0073): самого вызова не делаем. GUEST_HOSTCALL_REAL=1 возвращает
++ * настоящий вызов — только для отладки там, где seccomp не мешает; на телефоне
++ * и в AVD включать НЕЛЬЗЯ. (Ключ у mount и umount свой: GUEST_MOUNT_REAL.)
++ */
++static bool guest_hostcall_real(void)
++{
++    const char *r = getenv("GUEST_HOSTCALL_REAL");
++
++    return r && r[0] == '1';
++}
++
+ /* This is an internal helper for do_syscall so that it is easier
+  * to have a single return point, so that actions, such as logging
+  * of syscall results, can be performed.
+@@ -11149,6 +11162,10 @@
+         }
+         return ret;
+     case TARGET_NR_acct:
++        /* ★★★ Хозяину не отдаём (патч 0073): EPERM, как у ядра без CAP_SYS_PACCT. */
++        if (!guest_hostcall_real()) {
++            return -TARGET_EPERM;
++        }
+         if (arg1 == 0) {
+             ret = get_errno(acct(NULL));
+         } else {
+@@ -11190,6 +11207,10 @@
+     case TARGET_NR_umask:
+         return get_errno(umask(arg1));
+     case TARGET_NR_chroot:
++        /* ★★★ Хозяину не отдаём (патч 0073): EPERM; путь к тому же гостевой, не хозяйский. */
++        if (!guest_hostcall_real()) {
++            return -TARGET_EPERM;
++        }
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+         ret = get_errno(chroot(p));
+@@ -11689,7 +11710,8 @@
+     case TARGET_NR_sethostname:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(sethostname(p, arg2));
++        /* ★★★ Хозяину не отдаём (патч 0073): имя узла у гостя своё (патч 0061). */
++        ret = guest_hostcall_real() ? get_errno(sethostname(p, arg2)) : 0;
+         unlock_user(p, arg1, 0);
+         return ret;
+ #ifdef TARGET_NR_setrlimit
+@@ -11785,6 +11807,13 @@
+                 ptz = &tz;
+             }
+ 
++            /*
++             * ★★★ Хозяину не отдаём (патч 0073): время гостя и так идёт от
++             * хозяина, а отказ породил бы повторы NTP/NITZ.
++             */
++            if (!guest_hostcall_real()) {
++                return 0;
++            }
+             return get_errno(settimeofday(ptv, ptz));
+         }
+ #endif
+@@ -11902,6 +11931,10 @@
+ #endif
+ #ifdef TARGET_NR_swapon
+     case TARGET_NR_swapon:
++        /* ★★★ Хозяину не отдаём (патч 0073): EPERM, как у ядра без CAP_SYS_ADMIN. */
++        if (!guest_hostcall_real()) {
++            return -TARGET_EPERM;
++        }
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+         ret = get_errno(swapon(p, arg2));
+@@ -11909,6 +11942,13 @@
+         return ret;
+ #endif
+     case TARGET_NR_reboot:
++        /*
++         * ★★★ Хозяину не отдаём (патч 0073): EPERM. Протокол «гость просит
++         * перезагрузку» — отдельное решение, позже.
++         */
++        if (!guest_hostcall_real()) {
++            return -TARGET_EPERM;
++        }
+         if (arg3 == LINUX_REBOOT_CMD_RESTART2) {
+            /* arg4 must be ignored in all other cases */
+            p = lock_user_string(arg4);
+@@ -12248,6 +12288,31 @@
+         {
+             int len = arg2;
+ 
++            /*
++             * ★★★ Хозяину не отдаём (патч 0073): klogctl отсекает seccomp.
++             * Чтение — пустой буфер (гостю ничего не пишем), CLEAR и запросы
++             * размера — 0, остальные действия — EPERM; неизвестное — как прежде.
++             */
++            if (!guest_hostcall_real()) {
++                switch (arg1) {
++                case TARGET_SYSLOG_ACTION_READ:
++                case TARGET_SYSLOG_ACTION_READ_ALL:
++                case TARGET_SYSLOG_ACTION_READ_CLEAR:
++                case TARGET_SYSLOG_ACTION_CLEAR:
++                case TARGET_SYSLOG_ACTION_SIZE_UNREAD:
++                case TARGET_SYSLOG_ACTION_SIZE_BUFFER:
++                    return 0;
++                case TARGET_SYSLOG_ACTION_CLOSE:
++                case TARGET_SYSLOG_ACTION_OPEN:
++                case TARGET_SYSLOG_ACTION_CONSOLE_OFF:
++                case TARGET_SYSLOG_ACTION_CONSOLE_ON:
++                case TARGET_SYSLOG_ACTION_CONSOLE_LEVEL:
++                    return -TARGET_EPERM;
++                default:
++                    return -TARGET_EINVAL;
++                }
++            }
++
+             switch (arg1) {
+             case TARGET_SYSLOG_ACTION_CLOSE:         /* Close log */
+             case TARGET_SYSLOG_ACTION_OPEN:          /* Open log */
+@@ -12414,6 +12479,10 @@
+ #endif
+ #ifdef TARGET_NR_swapoff
+     case TARGET_NR_swapoff:
++        /* ★★★ Хозяину не отдаём (патч 0073), как и swapon. */
++        if (!guest_hostcall_real()) {
++            return -TARGET_EPERM;
++        }
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+         ret = get_errno(swapoff(p));
+@@ -12531,7 +12600,8 @@
+     case TARGET_NR_setdomainname:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(setdomainname(p, arg2));
++        /* ★★★ Хозяину не отдаём (патч 0073), как и sethostname. */
++        ret = guest_hostcall_real() ? get_errno(setdomainname(p, arg2)) : 0;
+         unlock_user(p, arg1, 0);
+         return ret;
+     case TARGET_NR_uname:
+@@ -12592,6 +12662,10 @@
+         {
+             struct timex host_buf;
+ 
++            /* ★★★ Хозяину не отдаём (патч 0073): EPERM. */
++            if (!guest_hostcall_real()) {
++                return -TARGET_EPERM;
++            }
+             if (target_to_host_timex(&host_buf, arg1) != 0) {
+                 return -TARGET_EFAULT;
+             }
+@@ -12609,6 +12683,10 @@
+         {
+             struct timex htx;
+ 
++            /* ★★★ Хозяину не отдаём (патч 0073): EPERM. */
++            if (!guest_hostcall_real()) {
++                return -TARGET_EPERM;
++            }
+             if (target_to_host_timex(&htx, arg2) != 0) {
+                 return -TARGET_EFAULT;
+             }
+@@ -12624,6 +12702,10 @@
+         {
+             struct timex htx;
+ 
++            /* ★★★ Хозяину не отдаём (патч 0073): EPERM. */
++            if (!guest_hostcall_real()) {
++                return -TARGET_EPERM;
++            }
+             if (target_to_host_timex64(&htx, arg2) != 0) {
+                 return -TARGET_EFAULT;
+             }
+@@ -14224,7 +14306,8 @@
+ 
+         ret = target_to_host_timespec(&ts, arg2);
+         if (!is_error(ret)) {
+-            ret = get_errno(clock_settime(arg1, &ts));
++            /* ★★★ Хозяину не отдаём (патч 0073), как и settimeofday. */
++            ret = guest_hostcall_real() ? get_errno(clock_settime(arg1, &ts)) : 0;
+         }
+         return ret;
+     }
+@@ -14236,7 +14319,8 @@
+ 
+         ret = target_to_host_timespec64(&ts, arg2);
+         if (!is_error(ret)) {
+-            ret = get_errno(clock_settime(arg1, &ts));
++            /* ★★★ Хозяину не отдаём (патч 0073), как и settimeofday. */
++            ret = guest_hostcall_real() ? get_errno(clock_settime(arg1, &ts)) : 0;
+         }
+         return ret;
+     }

@@ -1,0 +1,63 @@
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9381,6 +9381,18 @@
+                 ret = mount(p, p2, p3, (unsigned long)arg4, g2h(cpu, arg5));
+             }
+             ret = get_errno(ret);
++            /*
++             * ★ Монтирование — прощаем отказ по правам, по той же причине, что
++             * и unshare выше: сразу за ним зигота делает mount(MS_BIND) для
++             * /storage/emulated, и отказ там так же фатален для ребёнка.
++             *
++             * ⚠️ Цена: bind-монтирований не происходит, значит гостю НЕ видно
++             * /storage/emulated/<user>. Накопитель подставляет обвязка
++             * (поддельный vold и общая папка), и это отдельная дорога.
++             */
++            if (is_error(ret) && (ret == -TARGET_EPERM || ret == -TARGET_EACCES)) {
++                ret = 0;
++            }
+ 
+             if (arg1) {
+                 unlock_user(p, arg1, 0);
+@@ -13617,7 +13629,40 @@
+ #endif
+ #if defined(TARGET_NR_unshare) && defined(CONFIG_SETNS)
+     case TARGET_NR_unshare:
+-        return get_errno(unshare(arg1));
++        /*
++         * ★★★ Отдельное пространство имён монтирования — прощаем отказ.
++         *
++         * С 4.2 зигота на КАЖДЫЙ fork заводит своё пространство имён под
++         * эмулированную SD-карту (dalvik/vm/native/dalvik_system_Zygote.cpp,
++         * MountEmulatedStorage): unshare(CLONE_NEWNS), затем mount(MS_BIND).
++         * И то и другое требует CAP_SYS_ADMIN. На живом устройстве зигота —
++         * root; у нас обычный пользователь ни на обычном Linux, ни в приложении на
++         * телефоне, и права взять негде.
++         *
++         * Отказ для зиготы фатален, причём убивает она РЕБЁНКА:
++         *   E dalvikvm Failed to unshare(): Operation not permitted
++         *   E dalvikvm cannot mountExternalStorage(): Operation not permitted
++         *   E dalvikvm VM aborting
++         *   D Zygote   Process 16023 terminated by signal (6)
++         * — то есть НИ ОДИН процесс приложения не выживает: ни SystemUI, ни
++         * получатели PRE_BOOT_COMPLETED, а загрузка навсегда остаётся на
++         * «Android is upgrading… Starting apps».
++         *
++         * Врём ровно в одном: говорим «пространство отделено». Отделения не
++         * происходит, и это ровно то, что нам нужно: все процессы гостя видят
++         * одно дерево, а накопитель ему подставляет обвязка (поддельный vold),
++         * а не bind-монтирования.
++         *
++         * ⚠️ Прощаем ТОЛЬКО отказ по правам: прочие ошибки уходят гостю как
++         * есть, иначе мы скрыли бы настоящую поломку.
++         */
++        {
++            abi_long ush = get_errno(unshare(arg1));
++            if (is_error(ush) && (ush == -TARGET_EPERM || ush == -TARGET_EACCES)) {
++                ush = 0;
++            }
++            return ush;
++        }
+ #endif
+ #if defined(TARGET_NR_kcmp) && defined(__NR_kcmp)
+     case TARGET_NR_kcmp:

@@ -1,0 +1,77 @@
+sendmsg под musl: обнулять struct msghdr целиком, иначе ядро видит мусор.
+
+Симптом. PackageManager не может поговорить с installd, хотя соединение
+установлено (перевод путей AF_UNIX уже работает):
+
+  I Installer  connecting...
+  E Installer  write error
+  E Installer  write command failed? reconnect!
+  W PackageManager  Unable to create data directory: /data/data/com.vendor.app
+  … и так для каждого пакета прошивки
+
+С той стороны installd видит соединение и сразу конец файла:
+
+  I installd  new connection
+  E installd  eof
+  E installd  failed to read size
+
+Что показала инструментовка. Отказывает sendmsg на ДВУХБАЙТОВУЮ посылку в
+исправный сокет, и отказывает по-разному:
+
+  GUESTSOCK fd=46(socket:[564001111]) ret=-90 errno=90(Message too large)
+     type=1 sndbuf=229376 soerr=0 iovlen=1 iov0=2 controllen=0 flags=4000
+     | чистый sendmsg=2 write=2
+
+То есть тот же буфер, тот же дескриптор, тот же флаг — но со структурой,
+обнулённой memset, уходит успешно. В другом прогоне тот же вызов давал ENOBUFS.
+
+Причина. У musl в struct msghdr поля msg_iovlen и msg_controllen — 32-битные
+(int и socklen_t) с явными заполнителями __pad1/__pad2 рядом, а ядро читает их
+как 64-битные __kernel_size_t. Заполнители обнуляет обёртка sendmsg самого
+musl — но qemu зовёт СЫРОЙ системный вызов (safe_syscall), мимо неё. В
+заполнителях остаётся мусор со стека, ядро видит msg_iovlen вида
+0x????????00000001, это больше UIO_MAXIOV, и __copy_msghdr отвечает EMSGSIZE.
+Когда мусор попадал в __pad2, страдал msg_controllen и ответ был другим.
+
+На glibc заполнителей в структуре нет, и ошибки не видно вовсе — она
+проявляется только в сборке под Android, где libc у нас musl. Строка
+do_sendrecvmsg_locked — единственное место в linux-user, где struct msghdr
+собирается по полям, поэтому одного memset достаточно.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3249,6 +3249,34 @@
+     abi_ulong count;
+     struct iovec *vec;
+     abi_ulong target_vec;
++
++    /*
++     * ★ Обнулять ОБЯЗАТЕЛЬНО, и это не осторожность, а исправление ошибки.
++     *
++     * У musl в struct msghdr поля msg_iovlen и msg_controllen — 32-битные
++     * (int/socklen_t) с явными заполнителями __pad1/__pad2 рядом, а ядро
++     * читает их как 64-битные __kernel_size_t. Обнуляет заполнители обёртка
++     * sendmsg самого musl — но qemu зовёт СЫРОЙ системный вызов
++     * (safe_syscall), мимо неё. Заполнители остаются мусором со стека, и ядро
++     * видит msg_iovlen вида 0x????????00000001 — то есть гораздо больше
++     * UIO_MAXIOV.
++     *
++     * Снаружи это выглядит совершенно не так: PackageManager не может
++     * поговорить с installd,
++     *
++     *   I Installer  connecting...
++     *   E Installer  write error
++     *   E Installer  write command failed? reconnect!
++     *
++     * а sendmsg на двухбайтовую посылку в исправный AF_UNIX SOCK_STREAM
++     * отдаёт то EMSGSIZE, то ENOBUFS — в зависимости от того, какой мусор
++     * лежал на стеке. Тот же буфер тем же вызовом, но с обнулённой структурой,
++     * уходит успешно — это и было доказательством.
++     *
++     * На glibc заполнителей нет и ошибка не проявляется: она видна только в
++     * сборке под Android, где libc — musl.
++     */
++    memset(&msg, 0, sizeof(msg));
+ 
+     if (msgp->msg_name) {
+         msg.msg_namelen = tswap32(msgp->msg_namelen);

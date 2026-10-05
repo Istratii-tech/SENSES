@@ -1,0 +1,58 @@
+SO_RCVBUFFORCE гостю: мягкая замена вместо отказа.
+
+Симптом. netd прошивки 4.1 не стартует, а без него загрузка встаёт навсегда
+(NetworkManagementService.create ждёт его соединения без таймаута):
+
+  E Netd  Unable to set uevent socket SO_RCVBUFFORCE option: Operation not permitted
+  E Netd  Unable to start NetlinkManager (Operation not permitted)
+  · netd завершился, код 1
+
+Причина. `SO_RCVBUFFORCE` — это «поставить размер приёмного буфера В ОБХОД
+предела `net.core.rmem_max`», и он требует `CAP_NET_ADMIN` у ХОЗЯИНА. У
+приложения его нет и быть не может. NetlinkManager::start считает отказ
+смертельным и выходит.
+
+⚠️ Патч 0014 такой отказ уже прощает, но ТОЛЬКО на подставном сокете: он
+включается, когда настоящий `socket(PF_NETLINK…)` отказал по правам. На этом
+телефоне сокет создаётся успешно, значит подмены нет — и `setsockopt` уходит
+живому ядру, которое честно отвечает EPERM.
+
+Решение. Отказ по правам именно на «…FORCE» переводим в обычный
+`SO_RCVBUF`/`SO_SNDBUF`: смысл вызова — «хочу буфер побольше», и обычный вариант
+делает ровно это, только не выше предела ядра. Если и он не удался — отвечаем
+успехом: размер буфера не то, из-за чего служба вправе не запуститься.
+
+★ Настоящий вызов делается ПЕРВЫМ, и там, где права есть, поведение не меняется:
+прятать работающую возможность подменой нельзя (то же правило, что в 0014).
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -2481,6 +2481,28 @@
+ 	if (get_user_u32(val, optval_addr))
+             return -TARGET_EFAULT;
+ 	ret = get_errno(setsockopt(sockfd, SOL_SOCKET, optname, &val, sizeof(val)));
++        /*
++         * ★ «…FORCE» требует CAP_NET_ADMIN у хозяина — у приложения его нет.
++         * Переводим в обычную установку размера буфера, а если и она не
++         * удалась, отвечаем успехом: из-за размера буфера службе прошивки
++         * незачем не запускаться (см. qemu/patches/0019-sockbufforce-fallback).
++         */
++        if (ret == -TARGET_EPERM || ret == -TARGET_EACCES) {
++            int soft = 0;
++
++            if (optname == SO_RCVBUFFORCE) {
++                soft = SO_RCVBUF;
++            } else if (optname == SO_SNDBUFFORCE) {
++                soft = SO_SNDBUF;
++            }
++            if (soft != 0) {
++                ret = get_errno(setsockopt(sockfd, SOL_SOCKET, soft, &val,
++                                           sizeof(val)));
++                if (ret < 0) {
++                    ret = 0;
++                }
++            }
++        }
+         break;
+ #ifdef SOL_NETLINK
+     case SOL_NETLINK:

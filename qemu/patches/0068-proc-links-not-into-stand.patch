@@ -1,0 +1,257 @@
+Цели ссылок /proc не ведут в каталоги стенда: exe чужого процесса — его программа.
+
+Симптом (регресс 24.09, Р-28, найдено на №3). Изнутри гостя цели ссылок
+`/proc/<pid>/…` показывали хозяйские пути стенда:
+  * `exe` у 24 процессов гостя — `/data/app/<пакет стенда>-…/lib/arm64/
+    libqemu.so`, у демона binder — его банка, у процесса приложения —
+    `/system/bin/app_process64` хозяина;
+  * `fd/N` у 25 описателей — `/data/data/<пакет стенда>/files/bin/
+    binder-warn.log` и `guestnet.log`: журналы самого транслятора, которые он
+    открывает в каждом процессе гостя.
+Сами файлы гостю недоступны (путь уводит в дерево, там их нет), но имя
+нашего пакета и каталоги стенда он видел.
+
+Причина. `exe` чужого процесса у ядра — исполняемый файл ХОЗЯИНА, то есть
+транслятор; qemu подменяет только `/proc/self/exe` (exec_path). А перевод
+ответа readlink (0063) знает только дерево и общую папку: всё прочее отдаёт
+как есть.
+
+Теперь:
+  * `/proc/<чужой pid>/exe` — программа гостя: в строке запуска нашего
+    процесса она стоит хозяйским путём под корнем (`-L <корень>`), гостевой
+    путь — тот же без корня. Потомки зиготы наследуют её строку и получают
+    `/system/bin/app_process`, как на аппарате. Не наш гость — отказ
+    (EACCES), как ядро отвечает о чужом процессе без права;
+  * `/proc/self/exe` — гостевым путём: exec_path у нас хозяйский (гостевой
+    execve перезапускает qemu с путём под корнем дерева), и `readlink` отдавал
+    гостю «<дом>/files/roots/N/system/…»; открывать и перезапускать
+    по-прежнему по хозяйскому — перевод только в ответе readlink;
+  * цель ссылки в доме приложения стенда (`<дом>` из `<дом>/files/roots/N`,
+    по заданному и по настоящему имени) или в его пакете
+    (`/data/app/<пакет>-…`) — «/dev/null»: так у аппарата выглядит вывод
+    служб, а журналов транслятора у него нет вовсе.
+
+--- a/util/path.c
++++ b/util/path.c
+@@ -156,6 +156,15 @@
+ static char *base_real;          /* корень по realpath: /data/data/… против /data/user/0/… */
+ static char *sdcard_real;
+ static char *guest_cwd;          /* гостевой путь, всегда сведён */
++/*
++ * ★ Каталоги самого стенда (регресс 24.09, Р-28): дом приложения (`<дом>` из
++ * `<дом>/files/roots/N`, по заданному имени и по настоящему) и его пакет
++ * (`/data/app/<пакет>-…`). Цели ссылок, ведущие туда, гостю незачем: это
++ * журналы самого транслятора, открытые в каждом процессе гостя, и сам
++ * транслятор. См. path_link_to_guest.
++ */
++static char *stand_home[2];
++static char *stand_apk;
+ static QemuMutex cwd_lock;
+ 
+ static bool has_prefix(const char *s, const char *pre, const char **rest)
+@@ -252,6 +261,41 @@
+     qemu_mutex_unlock(&cwd_lock);
+ }
+ 
++static void stand_marks(const char *root)
++{
++    const char *f = strstr(root, "/files/");
++    int i;
++
++    if (!f || f == root) {
++        return;
++    }
++    for (i = 0; i < 2 && stand_home[i]; i++) {
++    }
++    if (i == 2) {
++        return;
++    }
++    stand_home[i] = g_strndup(root, f - root);
++    if (!stand_apk) {
++        const char *pkg = strrchr(stand_home[i], '/');
++
++        if (pkg && pkg[1]) {
++            stand_apk = g_strconcat("/data/app/", pkg + 1, "-", NULL);
++        }
++    }
++}
++
++static bool stand_path(const char *host)
++{
++    int i;
++
++    for (i = 0; i < 2; i++) {
++        if (stand_home[i] && has_prefix(host, stand_home[i], NULL)) {
++            return true;
++        }
++    }
++    return stand_apk && strncmp(host, stand_apk, strlen(stand_apk)) == 0;
++}
++
+ /* Хозяйский путь → гостевой; NULL — он вне дерева и общей папки. */
+ char *path_to_guest(const char *host)
+ {
+@@ -477,6 +521,10 @@
+             base_real = g_strdup(r);
+         }
+         free(r);
++        stand_marks(base);
++        if (base_real) {
++            stand_marks(base_real);
++        }
+         if (sdcard_base) {
+             r = realpath(sdcard_base, NULL);
+             if (r && strcmp(r, sdcard_base) != 0) {
+@@ -808,7 +856,16 @@
+     tmp[len] = '\0';
+     g = path_to_guest(tmp);
+     if (!g) {
+-        return len;
++        if (!stand_path(tmp)) {
++            return len;
++        }
++        /*
++         * ★ Каталог стенда (Р-28): гость видел в `/proc/<pid>/fd` журналы
++         * самого транслятора (`<дом>/files/bin/binder-warn.log`) — с именем
++         * нашего пакета. Такой описатель у настоящего аппарата не бывает
++         * вовсе; ближе всего к правде — «/dev/null», как у вывода служб.
++         */
++        g = g_strdup("/dev/null");
+     }
+     n = strlen(g);
+     if (n > cap) {
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9199,7 +9199,97 @@
+  * fscanf("%s") в AwesomePlayer сносил ей канарейку и валил mediaserver.
+  *
+  * Возвращаем 1, если ответ наш (в *out — готовый дескриптор либо -errno).
++ */
++/*
++ * ★ `/proc/self/exe` гостю — ГОСТЕВЫМ путём (регресс 24.09, Р-28). exec_path —
++ * тот путь, которым qemu запущен, а гостевой execve перезапускает его с
++ * хозяйским путём под корнем дерева (`<дом>/files/roots/N/system/bin/…`):
++ * `readlink /proc/self/exe` отдавал его гостю как есть. Открывать и
++ * перезапускать по-прежнему надо хозяйский — поэтому перевод только здесь.
++ */
++static const char *guest_exec_path(void)
++{
++    static char *g;
++
++    if (!g) {
++        char *t = path_to_guest(exec_path);
++
++        g = t ? t : g_strdup(exec_path);
++    }
++    return g;
++}
++
++/*
++ * ★ `/proc/<чужой pid>/exe` (регресс 24.09, Р-28). У ядра это исполняемый файл
++ * ХОЗЯИНА — транслятор из пакета стенда (`/data/app/<пакет>-…/lib/arm64/
++ * libqemu.so`), и гость видел имя нашего пакета и путь к нему. Гостю — его
++ * программа: в строке запуска нашего процесса она стоит хозяйским путём под
++ * корнем дерева (форма — у guest_cmdline_of_other ниже), гостевой путь — этот
++ * же путь без корня. Потомки зиготы наследуют её строку и получают
++ * `/system/bin/app_process` — как на аппарате.
++ * Процесс не нашего гостя (демон binder, само приложение) — отказ, как ядро
++ * отвечает о чужом процессе без права. Своё отдаёт exec_path (qemu).
++ * Возврат: длина ответа, −errno или 0 — не этот случай (пусть отвечает ядро).
+  */
++static ssize_t guest_exe_of_other(const char *pathname, char *out, size_t cap)
++{
++    char host[64], buf[4096];
++    const char *tok[128], *root = NULL;
++    long pid;
++    char *end;
++    int fd, i, n, ntok = 0;
++    size_t rl;
++
++    if (!pathname || strncmp(pathname, "/proc/", 6) != 0) {
++        return 0;
++    }
++    pid = strtol(pathname + 6, &end, 10);
++    if (end == pathname + 6 || strcmp(end, "/exe") != 0 || pid <= 0 ||
++        pid == (long)getpid()) {
++        return 0;
++    }
++    snprintf(host, sizeof host, "/proc/%ld/cmdline", pid);
++    fd = open(host, O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        return 0;               /* нет процесса — пусть отвечает ядро */
++    }
++    n = (int)read(fd, buf, sizeof buf - 1);
++    close(fd);
++    if (n <= 0) {
++        return -EACCES;
++    }
++    buf[n] = 0;
++    for (i = 0; i < n && ntok < (int)ARRAY_SIZE(tok); ) {
++        tok[ntok++] = buf + i;
++        while (i < n && buf[i]) {
++            i++;
++        }
++        i++;
++    }
++    for (i = 0; i + 1 < ntok; i++) {
++        if (strcmp(tok[i], "-L") == 0) {
++            root = tok[i + 1];
++            break;
++        }
++    }
++    if (!root || !root[0]) {
++        return -EACCES;
++    }
++    rl = strlen(root);
++    for (i = 0; i < ntok; i++) {
++        if (strncmp(tok[i], root, rl) == 0 && tok[i][rl] == '/') {
++            size_t len = strlen(tok[i] + rl);
++
++            if (len > cap) {
++                len = cap;
++            }
++            memcpy(out, tok[i] + rl, len);
++            return (ssize_t)len;
++        }
++    }
++    return -EACCES;
++}
++
+ static int guest_cmdline_of_other(const char *pathname, int *out)
+ {
+     char host[64];
+@@ -9482,9 +9572,15 @@
+          * Don't worry about sign mismatch as earlier mapping
+          * logic would have thrown a bad address error.
+          */
+-        ret = MIN(strlen(exec_path), bufsiz);
++        ret = MIN(strlen(guest_exec_path()), bufsiz);
+         /* We cannot NUL terminate the string. */
+-        memcpy(buf, exec_path, ret);
++        memcpy(buf, guest_exec_path(), ret);
++    } else if ((ret = guest_exe_of_other(pathname, buf, bufsiz)) != 0) {
++        /* ★ Чужой /proc/<pid>/exe — программа гостя, а не транслятор (Р-28). */
++        if (ret < 0) {
++            errno = -ret;
++            ret = -1;
++        }
+     } else if (path_proc_readlink_at(AT_FDCWD, pathname, &plink)) {
+         /* ★ Сама ссылка /proc/…/root|cwd — её цель гостевым путём (Р-24). */
+         ret = MIN(strlen(plink), bufsiz);
+@@ -11641,9 +11737,14 @@
+                  * Don't worry about sign mismatch as earlier mapping
+                  * logic would have thrown a bad address error.
+                  */
+-                ret = MIN(strlen(exec_path), arg4);
++                ret = MIN(strlen(guest_exec_path()), arg4);
+                 /* We cannot NUL terminate the string. */
+-                memcpy(p2, exec_path, ret);
++                memcpy(p2, guest_exec_path(), ret);
++            } else if ((ret = guest_exe_of_other(p, p2, arg4)) != 0) {
++                /* ★ Чужой /proc/<pid>/exe (Р-28, см. do_guest_readlink). */
++                if (ret < 0) {
++                    ret = -host_to_target_errno(-ret);
++                }
+             } else if (path_proc_readlink_at(arg1, p, &plink)) {
+                 /* ★ Сама ссылка /proc/…/root|cwd (Р-24, см. do_guest_readlink). */
+                 ret = MIN(strlen(plink), arg4);

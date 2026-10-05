@@ -1,0 +1,45 @@
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -3308,7 +3308,30 @@
+     for (i = 0; i < ehdr->e_phnum; ++i) {
+         struct elf_phdr *eppnt = phdr + i;
+         if (eppnt->p_type == PT_LOAD) {
+-            abi_ulong a = eppnt->p_vaddr & TARGET_PAGE_MASK;
++            abi_ulong a;
++
++            /*
++             * Skip zero-sized PT_LOAD segments.
++             *
++             * The Linux kernel handles this case explicitly -- see
++             * fs/binfmt_elf.c, elf_map(): "mmap() will return -EINVAL if
++             * given a zero size, but a segment with zero filesize is
++             * perfectly valid".
++             *
++             * Skipping is mandatory here for a second reason: with
++             * p_memsz == 0 the expression p_vaddr + p_memsz - 1 wraps
++             * around and pushes hiaddr to the top of the address space.
++             * The reservation below then asks target_mmap() for the whole
++             * address space at address 0 and fails with EINVAL.
++             *
++             * Android 2.3 /system/bin/linker contains exactly such a
++             * segment: LOAD off 0xd4 vaddr 0x0 filesz 0x0 memsz 0x0.
++             */
++            if (eppnt->p_memsz == 0 && eppnt->p_filesz == 0) {
++                continue;
++            }
++
++            a = eppnt->p_vaddr & TARGET_PAGE_MASK;
+             if (a < loaddr) {
+                 loaddr = a;
+             }
+@@ -3420,6 +3443,10 @@
+                 info->pt_dynamic_addr = phdr[i].p_vaddr + load_bias;
+                 break;
+             case PT_LOAD:
++                /* Kept in sync with the nsegs count computed above. */
++                if (phdr[i].p_memsz == 0 && phdr[i].p_filesz == 0) {
++                    break;
++                }
+                 loadsegs->addr = phdr[i].p_vaddr + load_bias;
+                 loadsegs->p_vaddr = phdr[i].p_vaddr;
+                 loadsegs->p_memsz = phdr[i].p_memsz;

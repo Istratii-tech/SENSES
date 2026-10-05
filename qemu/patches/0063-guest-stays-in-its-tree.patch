@@ -1,0 +1,837 @@
+Гость не выходит из своего дерева: относительные пути, «..», /proc/self/{root,cwd}.
+
+Симптом (регресс 24.09, Р-2, все три прошивки). Изнутри гостя, его же
+оболочкой:
+
+  cd /data; ls ../..         → все контейнеры и снимки песочницы стенда
+  ls ../../../keys           → merge.key — ключ подписи связок
+  ls /data/../../../keys     → то же абсолютным путём
+  ls /proc/self/root/sdcard/ → весь накопитель телефона (19 записей)
+  ls /proc/self/cwd/         → закрытые файлы стенда: сертификат посредника,
+                               сокеты (рабочий каталог КАЖДОГО процесса гостя —
+                               files/bin стенда)
+
+Требование человека — прошивка видит только свою часть файловой системы и
+общую папку — нарушалось у всех трёх.
+
+Причины. path() переводил только АБСОЛЮТНЫЕ имена и «..» не сводил:
+g_build_filename(корень, "/data/../../..") уводил за корень ядром телефона;
+относительное имя ядро разрешало от настоящего рабочего каталога; ссылки
+/proc/<процесс>/{root,cwd} вели к хозяйским путям. faccessat, faccessat2,
+renameat2 и statx путь не переводили вовсе.
+
+Решение (util/path.c):
+  * у гостя свой рабочий каталог гостевым путём; относительное имя
+    приклеивается к нему; chdir/fchdir/getcwd — через него (при execve он
+    переходит к дочернему qemu через настоящий каталог, который теперь
+    всегда в дереве);
+  * любой путь сводится по буквам, «..» выше «/» не поднимается (как у
+    общей папки, 0041); уже чистый абсолютный путь ищется как есть, без
+    выделения памяти — это горячая дорога;
+  * /proc/<свой|число>[/task/N]/root… — корень гостя, …/cwd… — его каталог;
+  * вызовы с каталогом-описателем идут через path_at: путь описателя
+    переводится обратно в гостевой и приклеивается так же;
+  * readlink/readlinkat отдают гостю гостевой путь (path_link_to_guest), а
+    ссылку с абсолютной целью, которую создаёт гость, пишем переведённой, в
+    дерево (path_link_target): иначе ядро разрешает её от корня телефона — так
+    installd делает /data/data/<пакет>/lib -> /data/app-lib/<пакет>.
+
+⚠️ Сведение по буквам: «..» после ссылки на каталог снимает саму ссылку, а не
+уходит в родителя её цели. Для гостя это безопасная сторона.
+⚠️ Корень дерева ядро называет настоящим именем (/data/data/…), а задан он как
+/data/user/0/… — для обратного перевода берём оба (realpath).
+
+--- a/util/path.c
++++ b/util/path.c
+@@ -121,7 +121,258 @@
+  * ★★★ Общая папка: свой перевод пути. Подробности — в заголовке патча 0041.
+  */
+ static const char *sdcard_base;
++
++/*
++ * ★★★★★ ГОСТЬ НЕ ВЫХОДИТ ИЗ СВОЕГО ДЕРЕВА (регресс 24.09, Р-2).
++ *
++ * Перевод пути был только для АБСОЛЮТНЫХ имён и без сведения «..». Замер
++ * изнутри гостя на телефоне (все три прошивки):
++ *
++ *   cd /data; ls ../..        → все контейнеры и снимки песочницы стенда
++ *   ls ../../../keys           → ключ подписи связок
++ *   ls /data/../../../keys     → то же абсолютным путём
++ *   ls /proc/self/root/sdcard/ → весь накопитель телефона
++ *   ls /proc/self/cwd/         → закрытые файлы стенда (рабочий каталог
++ *                                каждого процесса гостя — files/bin)
++ *
++ * Причины: относительный путь и «..» разрешало ядро телефона от НАСТОЯЩЕГО
++ * рабочего каталога; `g_build_filename(корень, "/data/../../..")` уводил за
++ * корень; `/proc/<процесс>/{root,cwd}` вели к хозяйским путям.
++ *
++ * Теперь:
++ *  * у гостя свой рабочий каталог (guest_cwd), гостевым путём; относительное
++ *    имя приклеивается к нему, а не к настоящему;
++ *  * любой путь сводится по буквам (norm), и «..» не поднимается выше «/»;
++ *  * `/proc/<свой|число>/root…` — корень гостя, `…/cwd…` — его каталог;
++ *  * вызовы с каталогом-описателем (`openat` и родня) — через path_at: каталог
++ *    описателя переводится обратно в гостевой путь и приклеивается так же;
++ *  * `readlink` отдаёт гостю гостевой путь, а не хозяйский (path_link_to_guest),
++ *    и ссылки, которые гость создаёт с абсолютной целью, ведут в дерево.
++ *
++ * ⚠️ Сведение — по буквам, как у общей папки (0041): «..» после ссылки на
++ * каталог снимает саму ссылку, а не уходит в родителя её цели. Для гостя это
++ * безопасная сторона.
++ */
++static char *base_real;          /* корень по realpath: /data/data/… против /data/user/0/… */
++static char *sdcard_real;
++static char *guest_cwd;          /* гостевой путь, всегда сведён */
++static QemuMutex cwd_lock;
++
++static bool has_prefix(const char *s, const char *pre, const char **rest)
++{
++    size_t n = strlen(pre);
++
++    if (strncmp(s, pre, n) != 0 || (s[n] != '/' && s[n] != '\0')) {
++        return false;
++    }
++    if (rest) {
++        *rest = s + n;
++    }
++    return true;
++}
++
++/* Свести гостевой абсолютный путь: «.», «..», повторные «/»; выше «/» не выйти. */
++static char *norm(const char *abs)
++{
++    GString *out = g_string_new("");
++    const char *p = abs;
++
++    while (*p) {
++        const char *seg;
++        size_t len;
++
++        while (*p == '/') {
++            p++;
++        }
++        if (!*p) {
++            break;
++        }
++        seg = p;
++        while (*p && *p != '/') {
++            p++;
++        }
++        len = p - seg;
++        if (len == 1 && seg[0] == '.') {
++            continue;
++        }
++        if (len == 2 && seg[0] == '.' && seg[1] == '.') {
++            char *slash = strrchr(out->str, '/');
++
++            if (slash) {
++                g_string_truncate(out, slash - out->str);
++            }
++            continue;
++        }
++        g_string_append_c(out, '/');
++        g_string_append_len(out, seg, len);
++    }
++    if (out->len == 0) {
++        g_string_append_c(out, '/');
++    }
++    return g_string_free(out, FALSE);
++}
++
++/*
++ * Уже сведённый абсолютный путь вне /proc — такой ищем как есть, без
++ * выделения памяти: это горячая дорога (каждый open и stat гостя).
++ */
++static bool is_clean(const char *s)
++{
++    const char *p;
++
++    if (s[0] != '/' || strncmp(s, "/proc/", 6) == 0) {
++        return false;
++    }
++    for (p = s; *p; p++) {
++        if (p[0] == '/' &&
++            (p[1] == '/' ||
++             (p[1] == '.' && (p[2] == '/' || p[2] == '\0' ||
++                              (p[2] == '.' && (p[3] == '/' || p[3] == '\0')))))) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static char *cwd_get(void)
++{
++    char *c;
++
++    qemu_mutex_lock(&cwd_lock);
++    c = g_strdup(guest_cwd ? guest_cwd : "/");
++    qemu_mutex_unlock(&cwd_lock);
++    return c;
++}
++
++static void cwd_set(char *c)
++{
++    qemu_mutex_lock(&cwd_lock);
++    g_free(guest_cwd);
++    guest_cwd = c;
++    qemu_mutex_unlock(&cwd_lock);
++}
++
++/* Хозяйский путь → гостевой; NULL — он вне дерева и общей папки. */
++char *path_to_guest(const char *host)
++{
++    const char *rest;
++
++    if (!host || host[0] != '/') {
++        return NULL;
++    }
++    if (base && (has_prefix(host, base, &rest) ||
++                 (base_real && has_prefix(host, base_real, &rest)))) {
++        return g_strdup(*rest ? rest : "/");
++    }
++    if (sdcard_base && (has_prefix(host, sdcard_base, &rest) ||
++                        (sdcard_real && has_prefix(host, sdcard_real, &rest)))) {
++        return g_strconcat("/mnt/sdcard", rest, NULL);
++    }
++    return NULL;
++}
++
++static bool all_digits(const char *s, size_t n)
++{
++    size_t i;
++
++    for (i = 0; i < n; i++) {
++        if (!g_ascii_isdigit(s[i])) {
++            return false;
++        }
++    }
++    return n > 0;
++}
++
++/*
++ * `/proc/<self|thread-self|число>[/task/<число>]/root[/…]` — корень ГОСТЯ;
++ * `…/cwd[/…]` — рабочий каталог гостя (свой — из guest_cwd, чужой — обратным
++ * переводом его ссылки). Путь уже сведён; вход принадлежит нам.
++ */
++static char *proc_links(char *abs)
++{
++    const char *who, *slash, *p, *rest;
++    size_t wl;
++    bool self;
++
++    if (strncmp(abs, "/proc/", 6) != 0) {
++        return abs;
++    }
++    who = abs + 6;
++    slash = strchr(who, '/');
++    if (!slash) {
++        return abs;
++    }
++    wl = slash - who;
++    self = (wl == 4 && !strncmp(who, "self", 4)) ||
++           (wl == 11 && !strncmp(who, "thread-self", 11));
++    if (!self && !all_digits(who, wl)) {
++        return abs;
++    }
++    if (!self && (pid_t)atoi(who) == getpid()) {
++        self = true;
++    }
++    p = slash + 1;
++    if (strncmp(p, "task/", 5) == 0) {
++        const char *q = strchr(p + 5, '/');
++
++        if (!q) {
++            return abs;
++        }
++        p = q + 1;
++    }
++    if (has_prefix(p, "root", &rest)) {
++        char *r = norm(*rest ? rest : "/");
++
++        g_free(abs);
++        return r;
++    }
++    if (has_prefix(p, "cwd", &rest)) {
++        char *dir = NULL, *j, *r;
++
++        if (self) {
++            dir = cwd_get();
++        } else {
++            char link[64], host[PATH_MAX];
++            ssize_t n;
++
++            snprintf(link, sizeof link, "/proc/%.*s/cwd", (int)wl, who);
++            n = readlink(link, host, sizeof host - 1);
++            if (n > 0) {
++                host[n] = '\0';
++                dir = path_to_guest(host);
++            }
++            if (!dir) {
++                dir = g_strdup("/");
++            }
++        }
++        j = g_strconcat(dir, "/", rest, NULL);
++        r = norm(j);
++        g_free(j);
++        g_free(dir);
++        g_free(abs);
++        return r;
++    }
++    return abs;
++}
++
++/* Гостевой абсолютный путь для имени: относительное — от рабочего каталога гостя. */
++static char *absolute(const char *name)
++{
++    char *j, *r;
+ 
++    if (name[0] == '/') {
++        j = g_strdup(name);
++    } else {
++        char *c = cwd_get();
++
++        j = g_strconcat(c, "/", name, NULL);
++        g_free(c);
++    }
++    r = norm(j);
++    g_free(j);
++    return proc_links(r);
++}
++
+ /*
+  * ⚠️ Порядок ВАЖЕН: сначала длинные имена. Иначе `/storage/emulated/0` попало
+  * бы под правило для `/storage/emulated` (если его когда-нибудь добавят) и
+@@ -194,6 +445,9 @@
+ void init_paths(const char *prefix)
+ {
+     sdcard_base = getenv("GUEST_SDCARD");
++    if (sdcard_base && !sdcard_base[0]) {
++        sdcard_base = NULL;
++    }
+ 
+     if (prefix[0] == '\0' || !strcmp(prefix, "/")) {
+         return;
+@@ -209,51 +463,94 @@
+ 
+     hash = g_hash_table_new(g_str_hash, g_str_equal);
+     qemu_mutex_init(&lock);
++    qemu_mutex_init(&cwd_lock);
++
++    /*
++     * ★ Ядро отдаёт пути по настоящему имени: ссылки `/proc/self/fd/N` у нас
++     * начинаются с `/data/data/…`, а корень задан как `/data/user/0/…`. Для
++     * обратного перевода нужны оба.
++     */
++    {
++        char *r = realpath(base, NULL);
++
++        if (r && strcmp(r, base) != 0) {
++            base_real = g_strdup(r);
++        }
++        free(r);
++        if (sdcard_base) {
++            r = realpath(sdcard_base, NULL);
++            if (r && strcmp(r, sdcard_base) != 0) {
++                sdcard_real = g_strdup(r);
++            }
++            free(r);
++        }
++    }
++    /*
++     * ★ Рабочий каталог гостя — из настоящего. Он наследуется через execve
++     * (дочерний qemu заходит сюда заново), а гость, ни разу не звавший chdir,
++     * живёт в «/»: настоящий каталог у него — files/bin стенда, вне дерева.
++     */
++    {
++        char *host = g_get_current_dir();
++        char *g = path_to_guest(host);
++
++        guest_cwd = g ? norm(g) : g_strdup("/");
++        g_free(g);
++        g_free(host);
++    }
+ }
+ 
+-/* Look for path in emulation dir, otherwise return name. */
++/*
++ * Look for path in emulation dir, otherwise return the (normalised) name.
++ *
++ * ★ Имя — гостевое: абсолютное или относительное (от рабочего каталога
++ * гостя, см. шапку про Р-2). Возвращаемая строка живёт вечно (в таблице).
++ */
+ const char *path(const char *name)
+ {
+     gpointer key, value;
+     const char *ret;
++    char *abs = NULL;
++    const char *look;
+ 
+-    /* Only do absolute paths: quick and dirty, but should mostly be OK.  */
+-    if (!base || !name || name[0] != '/') {
++    if (!base || !name || name[0] == '\0') {
+         return name;
+     }
++    if (is_clean(name)) {
++        look = name;                    /* горячая дорога: без выделения памяти */
++    } else {
++        abs = absolute(name);
++        look = abs;
++    }
+ 
+     qemu_mutex_lock(&lock);
+ 
+     /* Have we looked up this file before?  */
+-    if (g_hash_table_lookup_extended(hash, name, &key, &value)) {
+-        ret = value ? value : name;
++    if (g_hash_table_lookup_extended(hash, look, &key, &value)) {
++        ret = value ? value : (const char *)key;
++        g_free(abs);
+     } else {
+-        char *save = g_strdup(name);
++        char *save = abs ? abs : g_strdup(name);
+         const char *rest;
+         char *full;
+ 
+-        if (sdcard_base && sdcard_prefix(name, &rest)) {
++        if (sdcard_base && sdcard_prefix(save, &rest)) {
+             /* ★ Общая папка — свой перевод, см. sdcard_map. */
+             full = sdcard_map(rest);
+         } else {
+-            full = g_build_filename(base, name, NULL);
++            full = g_build_filename(base, save, NULL);
+             /*
+              * Есть под корнем — берём. Нет, но это своя ветвь гостя (патчи
+              * 0004 и 0026) — тоже берём: создавать надо ПОД КОРНЕМ, а не у
+              * хозяина. Иначе пусть идёт как есть.
+              */
+-            if (access(full, F_OK) != 0 && !under_guest_write_root(name)) {
++            if (access(full, F_OK) != 0 && !under_guest_write_root(save)) {
+                 g_free(full);
+                 full = NULL;
+             }
+         }
+-        if (full) {
+-            g_hash_table_insert(hash, save, full);
+-            ret = full;
+-        } else {
+-            g_hash_table_insert(hash, save, NULL);
+-            ret = name;
+-        }
++        g_hash_table_insert(hash, save, full);
++        ret = full ? full : save;
+     }
+ 
+     qemu_mutex_unlock(&lock);
+@@ -261,6 +558,145 @@
+ }
+ 
+ /*
++ * То же для вызовов с каталогом-описателем (`openat`, `fstatat`, `unlinkat`…).
++ * Относительное имя приклеивается к ГОСТЕВОМУ пути этого каталога: иначе
++ * `openat(fd, "../../..")` поднимался бы из дерева ядром телефона.
++ */
++const char *path_at(int dirfd, const char *name)
++{
++    char link[64], host[PATH_MAX], *dir, *j;
++    const char *r;
++    ssize_t n;
++
++    if (!base || !name || name[0] == '\0' || name[0] == '/' || dirfd == AT_FDCWD) {
++        return path(name);
++    }
++    snprintf(link, sizeof link, "/proc/self/fd/%d", dirfd);
++    n = readlink(link, host, sizeof host - 1);
++    if (n <= 0) {
++        return name;                    /* не описатель каталога — решит ядро */
++    }
++    host[n] = '\0';
++    dir = path_to_guest(host);
++    if (!dir) {
++        dir = g_strdup(host);           /* вне дерева (/proc, /dev) — у гостя тот же */
++    }
++    j = g_strconcat(dir, "/", name, NULL);
++    r = path(j);
++    g_free(j);
++    g_free(dir);
++    return r;
++}
++
++/* chdir гостя: настоящий каталог — в дерево, гостевой — запомнить. */
++int path_chdir(const char *name)
++{
++    char *abs;
++    int r;
++
++    if (!base || !name || name[0] == '\0') {
++        return chdir(name);
++    }
++    abs = absolute(name);
++    r = chdir(path(abs));
++    if (r == 0) {
++        cwd_set(abs);
++    } else {
++        g_free(abs);
++    }
++    return r;
++}
++
++/* fchdir гостя удался — гостевой каталог по пути описателя. */
++void path_fchdir_done(int fd)
++{
++    char link[64], host[PATH_MAX], *g;
++    ssize_t n;
++
++    if (!base) {
++        return;
++    }
++    snprintf(link, sizeof link, "/proc/self/fd/%d", fd);
++    n = readlink(link, host, sizeof host - 1);
++    if (n <= 0) {
++        return;
++    }
++    host[n] = '\0';
++    g = path_to_guest(host);
++    if (g) {
++        char *c = norm(g);
++
++        g_free(g);
++        cwd_set(c);
++    } else {
++        cwd_set(g_strdup(host));
++    }
++}
++
++/* getcwd гостя: его каталог, а не files/bin стенда. Длина с нулём или -1. */
++ssize_t path_getcwd(char *buf, size_t size)
++{
++    char *c;
++    size_t n;
++
++    if (!base) {
++        return getcwd(buf, size) ? (ssize_t)strlen(buf) + 1 : -1;
++    }
++    c = cwd_get();
++    n = strlen(c) + 1;
++    if (n > size) {
++        g_free(c);
++        errno = ERANGE;
++        return -1;
++    }
++    memcpy(buf, c, n);
++    g_free(c);
++    return (ssize_t)n;
++}
++
++/*
++ * Ответ `readlink` — гостю гостевым путём: ссылки `/proc/<процесс>/fd/N`, `…/cwd`, а
++ * также ссылки, которые гость создал с абсолютной целью (path_link_target),
++ * у ядра указывают на хозяйские пути дерева. Возвращает новую длину.
++ */
++ssize_t path_link_to_guest(char *buf, ssize_t len, size_t cap)
++{
++    char tmp[PATH_MAX], *g;
++    size_t n;
++
++    if (!base || len <= 0 || (size_t)len >= sizeof tmp || buf[0] != '/') {
++        return len;
++    }
++    memcpy(tmp, buf, len);
++    tmp[len] = '\0';
++    g = path_to_guest(tmp);
++    if (!g) {
++        return len;
++    }
++    n = strlen(g);
++    if (n > cap) {
++        n = cap;
++    }
++    memcpy(buf, g, n);
++    g_free(g);
++    return (ssize_t)n;
++}
++
++/*
++ * Цель ссылки, которую создаёт гость. Абсолютную цель ядро разрешило бы от
++ * корня ТЕЛЕФОНА (так `installd` делает `/data/data/<пакет>/lib ->
++ * /data/app-lib/<пакет>`, и у ядра это хозяйский путь) — пишем её переведённой,
++ * в дерево; readlink отдаст гостю её обратно гостевой (path_link_to_guest).
++ */
++const char *path_link_target(const char *target)
++{
++    if (!base || !target || target[0] != '/') {
++        return target;
++    }
++    return path(target);
++}
++
++/*
+  * Корень для дочернего qemu. Гостевой execve пересобирается на вызов самого
+  * себя (см. linux-user/syscall.c), и ребёнку нужно передать тот же -L. База
+  * лежит в статической переменной этого файла, поэтому доступ — отсюда.
+--- a/include/qemu/path.h
++++ b/include/qemu/path.h
+@@ -5,5 +5,17 @@
+ const char *path(const char *pathname);
+ /* Корень, заданный ключом -L: нужен, чтобы передать его дочернему qemu. */
+ const char *path_prefix(void);
++/*
++ * ★ Гость не выходит из своего дерева (регресс 24.09, Р-2): относительные
++ * имена — от рабочего каталога гостя, вызовы с каталогом-описателем — от его
++ * гостевого пути, ответы readlink — гостевыми путями.
++ */
++const char *path_at(int dirfd, const char *pathname);
++int path_chdir(const char *pathname);
++void path_fchdir_done(int fd);
++ssize_t path_getcwd(char *buf, size_t size);
++ssize_t path_link_to_guest(char *buf, ssize_t len, size_t cap);
++const char *path_link_target(const char *target);
++char *path_to_guest(const char *host);
+ 
+ #endif
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -8602,7 +8602,7 @@
+     fh = g_malloc0(total_size);
+     fh->handle_bytes = size;
+ 
+-    ret = get_errno(name_to_handle_at(dirfd, path(name), fh, &mid, flags));
++    ret = get_errno(name_to_handle_at(dirfd, path_at(dirfd, name), fh, &mid, flags));
+     unlock_user(name, pathname, 0);
+ 
+     /* man name_to_handle_at(2):
+@@ -9360,9 +9360,9 @@
+         int ofd;
+ 
+         if (safe) {
+-            ofd = safe_openat(dirfd, path(pathname), flags, mode);
++            ofd = safe_openat(dirfd, path_at(dirfd, pathname), flags, mode);
+         } else {
+-            ofd = openat(dirfd, path(pathname), flags, mode);
++            ofd = openat(dirfd, path_at(dirfd, pathname), flags, mode);
+         }
+         /*
+          * ★ Открыли каталог потоков процесса? Запомним дескриптор: из его
+@@ -9401,6 +9401,10 @@
+         memcpy(buf, exec_path, ret);
+     } else {
+         ret = readlink(path(pathname), buf, bufsiz);
++        /* ★ Гостю — гостевой путь, а не хозяйский (Р-2, см. util/path.c). */
++        if (ret > 0) {
++            ret = path_link_to_guest(buf, ret, bufsiz);
++        }
+     }
+ 
+     return ret;
+@@ -10284,7 +10288,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(linkat(arg1, path(p), arg3, path(p2), arg5));
++                ret = get_errno(linkat(arg1, path_at(arg1, p), arg3, path_at(arg3, p2), arg5));
+             unlock_user(p, arg2, 0);
+             unlock_user(p2, arg4, 0);
+         }
+@@ -10332,7 +10336,7 @@
+     case TARGET_NR_unlinkat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(unlinkat(arg1, path(p), arg3));
++        ret = get_errno(unlinkat(arg1, path_at(arg1, p), arg3));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -10343,7 +10347,8 @@
+     case TARGET_NR_chdir:
+         if (!(p = lock_user_string(arg1)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(chdir(path(p)));
++        /* ★ Каталог гостя — в дерево и в память (Р-2, path_chdir). */
++        ret = get_errno(path_chdir(p));
+         unlock_user(p, arg1, 0);
+         return ret;
+ #ifdef TARGET_NR_time
+@@ -10370,7 +10375,7 @@
+     case TARGET_NR_mknodat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(mknodat(arg1, path(p), arg3, arg4));
++        ret = get_errno(mknodat(arg1, path_at(arg1, p), arg3, arg4));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -10641,7 +10646,7 @@
+             if (!(p = lock_user_string(arg2))) {
+                 return -TARGET_EFAULT;
+             }
+-            ret = get_errno(futimesat(arg1, path(p), tvp));
++            ret = get_errno(futimesat(arg1, path_at(arg1, p), tvp));
+             unlock_user(p, arg2, 0);
+         }
+         return ret;
+@@ -10660,7 +10665,7 @@
+         if (!(p = lock_user_string(arg2))) {
+             return -TARGET_EFAULT;
+         }
+-        ret = get_errno(faccessat(arg1, p, arg3, 0));
++        ret = get_errno(faccessat(arg1, path_at(arg1, p), arg3, 0));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -10669,7 +10674,7 @@
+         if (!(p = lock_user_string(arg2))) {
+             return -TARGET_EFAULT;
+         }
+-        ret = get_errno(faccessat(arg1, p, arg3, arg4));
++        ret = get_errno(faccessat(arg1, path_at(arg1, p), arg3, arg4));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -10710,7 +10715,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(renameat(arg1, path(p), arg3, path(p2)));
++                ret = get_errno(renameat(arg1, path_at(arg1, p), arg3, path_at(arg3, p2)));
+             unlock_user(p2, arg4, 0);
+             unlock_user(p, arg2, 0);
+         }
+@@ -10725,7 +10730,8 @@
+             if (!p || !p2) {
+                 ret = -TARGET_EFAULT;
+             } else {
+-                ret = get_errno(sys_renameat2(arg1, p, arg3, p2, arg5));
++                ret = get_errno(sys_renameat2(arg1, path_at(arg1, p), arg3,
++                                              path_at(arg3, p2), arg5));
+             }
+             unlock_user(p2, arg4, 0);
+             unlock_user(p, arg2, 0);
+@@ -10757,7 +10763,7 @@
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+         {
+-            const char *hp = path(p);
++            const char *hp = path_at(arg1, p);
+ 
+             ret = get_errno(mkdirat(arg1, hp, guest_dir_mode(arg3)));
+             /*
+@@ -11472,7 +11478,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(symlink(p, path(p2)));
++                ret = get_errno(symlink(path_link_target(p), path(p2)));
+             unlock_user(p2, arg2, 0);
+             unlock_user(p, arg1, 0);
+         }
+@@ -11487,7 +11493,7 @@
+             if (!p || !p2)
+                 ret = -TARGET_EFAULT;
+             else
+-                ret = get_errno(symlinkat(p, arg2, path(p2)));
++                ret = get_errno(symlinkat(path_link_target(p), arg2, path_at(arg2, p2)));
+             unlock_user(p2, arg3, 0);
+             unlock_user(p, arg1, 0);
+         }
+@@ -11525,7 +11531,10 @@
+                 /* We cannot NUL terminate the string. */
+                 memcpy(p2, exec_path, ret);
+             } else {
+-                ret = get_errno(readlinkat(arg1, path(p), p2, arg4));
++                ret = get_errno(readlinkat(arg1, path_at(arg1, p), p2, arg4));
++                if (!is_error(ret) && ret > 0) {
++                    ret = path_link_to_guest(p2, ret, arg4);
++                }
+             }
+             unlock_user(p2, arg3, ret);
+             unlock_user(p, arg2, 0);
+@@ -11649,7 +11658,8 @@
+     case TARGET_NR_fchmodat:
+         if (!(p = lock_user_string(arg2)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(fchmodat(arg1, path(p), guest_chmod_mode(path(p), arg3), 0));
++        ret = get_errno(fchmodat(arg1, path_at(arg1, p),
++                                 guest_chmod_mode(path_at(arg1, p), arg3), 0));
+         unlock_user(p, arg2, 0);
+         return ret;
+ #endif
+@@ -12268,7 +12278,11 @@
+     case TARGET_NR_getpgid:
+         return get_errno(getpgid(arg1));
+     case TARGET_NR_fchdir:
+-        return get_errno(fchdir(arg1));
++        ret = get_errno(fchdir(arg1));
++        if (!is_error(ret)) {
++            path_fchdir_done(arg1);         /* ★ каталог гостя (Р-2) */
++        }
++        return ret;
+     case TARGET_NR_personality:
+         return get_errno(personality(arg1));
+ #ifdef TARGET_NR__llseek /* Not on alpha */
+@@ -12679,7 +12693,8 @@
+     case TARGET_NR_getcwd:
+         if (!(p = lock_user(VERIFY_WRITE, arg1, arg2, 0)))
+             return -TARGET_EFAULT;
+-        ret = get_errno(sys_getcwd1(p, arg2));
++        /* ★ Гостю — его каталог, а не files/bin стенда (Р-2). */
++        ret = get_errno(path_prefix() ? path_getcwd(p, arg2) : sys_getcwd1(p, arg2));
+         unlock_user(p, arg1, ret);
+         return ret;
+     case TARGET_NR_capget:
+@@ -12880,7 +12895,7 @@
+         if (!(p = lock_user_string(arg2))) {
+             return -TARGET_EFAULT;
+         }
+-        ret = get_errno(fstatat(arg1, path(p), &st, arg4));
++        ret = get_errno(fstatat(arg1, path_at(arg1, p), &st, arg4));
+         unlock_user(p, arg2, 0);
+         if (!is_error(ret))
+             ret = host_to_target_stat64(cpu_env, arg3, &st);
+@@ -12905,7 +12920,7 @@
+                 struct target_statx host_stx;
+                 int mask = arg4;
+ 
+-                ret = get_errno(sys_statx(dirfd, p, flags, mask, &host_stx));
++                ret = get_errno(sys_statx(dirfd, path_at(dirfd, p), flags, mask, &host_stx));
+                 if (!is_error(ret)) {
+                     if (host_to_target_statx(&host_stx, arg5) != 0) {
+                         unlock_user(p, arg2, 0);
+@@ -12919,7 +12934,7 @@
+                 }
+             }
+ #endif
+-            ret = get_errno(fstatat(dirfd, path(p), &st, flags));
++            ret = get_errno(fstatat(dirfd, path_at(dirfd, p), &st, flags));
+             unlock_user(p, arg2, 0);
+ 
+             if (!is_error(ret)) {
+@@ -13047,9 +13062,9 @@
+     case TARGET_NR_fchownat:
+         if (!(p = lock_user_string(arg2))) 
+             return -TARGET_EFAULT;
+-        ret = guest_own(get_errno(fchownat(arg1, path(p), low2highuid(arg3),
++        ret = guest_own(get_errno(fchownat(arg1, path_at(arg1, p), low2highuid(arg3),
+                                          low2highgid(arg4), arg5)), "fchownat");
+-        guest_own_note_path(path(p), (arg5 & AT_SYMLINK_NOFOLLOW) ? 1 : 0,
++        guest_own_note_path(path_at(arg1, p), (arg5 & AT_SYMLINK_NOFOLLOW) ? 1 : 0,
+                           arg3, arg4);
+         unlock_user(p, arg2, 0);
+         return ret;
+@@ -14004,7 +14019,7 @@
+                 if (!(p = lock_user_string(arg2))) {
+                     return -TARGET_EFAULT;
+                 }
+-                ret = get_errno(sys_utimensat(arg1, path(p), tsp, arg4));
++                ret = get_errno(sys_utimensat(arg1, path_at(arg1, p), tsp, arg4));
+                 unlock_user(p, arg2, 0);
+             }
+         }
+@@ -14033,7 +14048,7 @@
+                 if (!p) {
+                     return -TARGET_EFAULT;
+                 }
+-                ret = get_errno(sys_utimensat(arg1, path(p), tsp, arg4));
++                ret = get_errno(sys_utimensat(arg1, path_at(arg1, p), tsp, arg4));
+                 unlock_user(p, arg2, 0);
+             }
+         }

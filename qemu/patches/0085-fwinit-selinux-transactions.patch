@@ -1,0 +1,124 @@
+Режим «init прошивки»: транзакционные файлы selinuxfs — access, context, create, relabel, member, user (только при GUEST_FWINIT=1 И GUEST_SELINUX=1).
+
+Симптом. Служба свойств 5.0+ спрашивает у libselinux, вправе ли источник писать
+свойство (selinux_check_access), init считает домен службы без seclabel
+(security_compute_create), а проверка контекста идёт через selinuxfs. Всё это —
+«запись запроса, потом чтение ответа тем же описателем» файлов access, create,
+context… Обычный файл так не умеет: ответ на чтение — не то, что записали, а
+вычисление над запросом.
+
+Причина. В selinuxfs ядра эти файлы — транзакции (simple_transaction): запись
+считает ответ и запоминает его, чтение отдаёт.
+
+Решение. На ОТКРЫТИЕ гостевого пути /sys/fs/selinux/{access,context,create,
+relabel,member,user} (do_guest_openat) выдаётся описатель В ПАМЯТИ (memfd — у каждого
+открытия свой узел), запомненный в таблице процесса вместе с режимом открытия; его write
+и read исполняет транслятор (write, пустой write, read и close в syscall.c). Файл каталога
+selinuxfs при этом не открывается: гость мог подменить его ссылкой на чужой файл, а O_TRUNC и
+O_CREAT гостя дошли бы до цели (места под транзакции в каталоге — ссылки на /dev/null):
+  * access: ответ «ffffffff ffffffff 0 ffffffff 1 0» (allowed decided auditallow
+    auditdeny seqno flags — формат sscanf libselinux): разрешено всё, о успехах
+    ничего не записывать, seqno 1, flags 0; запрос не разбирается;
+  * context: контекст приходит со своим нулём (или без) — отвечаем тем же
+    контекстом с нулём (проверка и каноническая форма — успех); пустой — EINVAL;
+  * create, relabel, member: запрос «<источник> <цель> <номер класса>»; для класса
+    process — контекст «<пользователь>:<роль>:<тип>:<уровень>» источника, но тип —
+    имя типа файла цели без «_exec» (так Android называет файлы служб: vold_exec
+    → vold); у цели без суффикса домена нет — тип источника (так же ответит ядро
+    без type_transition; init 5.0 пишет «needs a SELinux domain» — это строка
+    журнала, не отказ); для прочих классов — объект: пользователь источника,
+    object_r, тип и уровень цели. Номер класса переводится в имя по словарю
+    (патч 0084). Не разобралось — EINVAL;
+  * user: ответ пуст.
+write возвращает длину запроса, read — ответ с начала; второй read — 0.
+
+⚠️ Запись в описатель, открытый на чтение, и чтение из открытого на запись — EBADF, как у
+ядра. Номера до 65535 (system_server и зигота держат тысячи описателей); выше — EMFILE.
+⚠️ dup, dup2, dup3 и fcntl(F_DUPFD) копию номера таблице не сообщают: запись и чтение через
+копию идут в память описателя как в обычный файл (ответа нет) — libselinux так не делает.
+⚠️ Таблица описателей — в памяти процесса: fork копирует её вместе с
+описателями (ребёнок и родитель ведут обмены каждый свой), execve теряет (описатель
+после этого — пустой memfd). Чужой файл с
+тем же номером (close_range, dup2 поверх) отсекается сверкой узла (dev, ino) при
+каждом вызове, как у guest_oom.c. Отметку снимает только close.
+⚠️ Пустой write (write(fd, NULL, 0), у libselinux так сбрасывают exec, fscreate и
+родню) приходит в syscall.c по ранней ветке и до этого патча шёл сразу ядру:
+теперь перед ним тоже стоит перехват.
+⚠️ Перехват только по абсолютному гостевому пути «/sys/fs/selinux/<имя>»:
+относительный (cd + open, openat с dirfd) попадёт на ссылку на /dev/null —
+запись примется, чтение вернёт 0, на диск хозяина ничего не пишется. libselinux ходит по абсолютным.
+⚠️ Без GUEST_FWINIT=1 или без GUEST_SELINUX=1 перехваты сводятся к проверке
+счётчика (read и write) и одному вызову на open — поведение прежнее.
+
+Проверка: tests/qemu/selinux.sh, случаи «3», «9» (место под access — ссылка гостя на чужой файл),
+«11» (описатель с номером 5000, режим открытия, fork, dup).
+
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -9488,6 +9488,19 @@
+     };
+ 
+     /*
++     * ★ SELinux «всё разрешено» (патч 0085): транзакционные файлы selinuxfs
++     * (access, context, create…) — описатель, чьи write и read исполняет
++     * транслятор (guest_selinux.c). Только при GUEST_FWINIT=1 и GUEST_SELINUX=1.
++     */
++    {
++        int sfd;
++
++        if (guest_selinux_try_open(fname, flags, &sfd)) {
++            return sfd < 0 ? -host_to_target_errno(errno) : sfd;
++        }
++    }
++
++    /*
+      * ★ Гостевой /dev/binder — наш: за ним стоит binderd в юзерспейсе, а не
+      * драйвер ядра. Отдавать гостю ХОЗЯЙСКИЙ /dev/binder нельзя ни в каком
+      * виде: на телефоне он существует, и гостевой ProcessState начинал
+@@ -10599,6 +10612,11 @@
+         } else {
+             if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
+                 return -TARGET_EFAULT;
++            /* ★ Описатель места под транзакцию SELinux: ответ даёт транслятор (патч 0085). */
++            if (guest_selinux_read(arg1, p, arg3, &ret)) {
++                unlock_user(p, arg2, ret > 0 ? ret : 0);
++                return ret;
++            }
+             ret = get_errno(safe_read(arg1, p, arg3));
+             if (ret > 0) {
+                 guest_fwinit_prop_data(arg1, p, ret);   /* патч 0080 */
+@@ -10612,6 +10630,13 @@
+         return ret;
+     case TARGET_NR_write:
+         if (arg2 == 0 && arg3 == 0) {
++            /*
++             * ★ Пустая запись — «очистить» у атрибутов процесса SELinux (патч 0085):
++             * libselinux так сбрасывает exec, fscreate и родню.
++             */
++            if (guest_selinux_write(arg1, NULL, 0, &ret)) {
++                return ret;
++            }
+             return get_errno(safe_write(arg1, 0, 0));
+         }
+         if (!(p = lock_user(VERIFY_READ, arg2, arg3, 1)))
+@@ -10621,6 +10646,11 @@
+             unlock_user(p, arg2, 0);
+             return ret;
+         }
++        /* ★ Описатель места под транзакцию SELinux: запрос разбирает транслятор (патч 0085). */
++        if (guest_selinux_write(arg1, p, arg3, &ret)) {
++            unlock_user(p, arg2, 0);
++            return ret;
++        }
+         if (fd_trans_target_to_host_data(arg1)) {
+             void *copy = g_malloc(arg3);
+             memcpy(copy, p, arg3);
+@@ -10707,6 +10737,7 @@
+         guest_proc_close(arg1);
+         guest_oom_close(arg1);
+         guest_fwinit_prop_closed(arg1);             /* патч 0080 */
++        guest_selinux_close(arg1);                  /* патч 0085 */
+         fd_trans_unregister(arg1);
+         return get_errno(close(arg1));
+ #if defined(__NR_close_range) && defined(TARGET_NR_close_range)

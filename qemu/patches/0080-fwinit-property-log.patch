@@ -1,0 +1,119 @@
+Режим «init прошивки»: записи свойств, принятые службой свойств init — стенду, GUEST_PROP_LOG (только при GUEST_FWINIT=1).
+
+Симптом. Стенд должен видеть записи свойств (sys.boot_completed, ctl.start…),
+не зная формата области свойств поколения: у 2.3–4.3 область одна, у 5.0+ другая,
+у 7.0 разделена по контекстам. А сообщение, которым клиент просит init записать
+свойство, у всех одно.
+
+Причина. Службу свойств ведёт сам init: сокет /dev/socket/property_service,
+accept, recv одного сообщения PROP_MSG_SETPROP (cmd 1, 128 байт: имя 32,
+значение 92), запись в область. Снаружи init этого не видно.
+
+Решение. При GUEST_FWINIT=1 и заданном GUEST_PROP_LOG процесс, сделавший bind
+на ГОСТЕВОЙ путь /dev/socket/property_service, запоминает слушающий описатель.
+Описатели из accept и accept4 на нём — соединения; на read, recv, recvfrom,
+recvmsg по такому описателю принятые байты собираются в сообщение (его
+присылают и целиком, и кусками), и на каждое сообщение cmd 1 в файл пишется строка
+
+  <время_мс> <pid init> <имя>=<значение>
+
+(имя и значение — до первого нуля, управляющие знаки — «?»). close снимает
+отметку. Чужие сокеты и сокеты других процессов не трогаются: таблица у каждого
+процесса своя и после execve пуста. Запись, которую init делает сам (ro.*,
+init.svc.*), в журнал не попадает — это нормально.
+
+⚠️ Сообщения с другим cmd (протокол с переменной длиной) пропускаются — до этого
+шага не разбираются. MSG_PEEK данные не расходует и не учитывается.
+⚠️ Отметку снимает ТОЛЬКО close: dup2, dup3 поверх отмеченного номера и
+close_range её не снимают (init 2.3–4.4 так не делает; последствие — лишняя
+строка журнала, если чужие байты на том же номере начнутся со слова 1).
+⚠️ Строка пишется ВНЕ замка таблицы: готовое сообщение копируется, замок
+отпускается, и только потом файл открывается и пишется. Медленный файл не
+держит чужие read, а fork при занятом чужим потоком замке не оставит его
+занятым у ребёнка.
+⚠️ GUEST_PROP_LOG — абсолютный путь (относительное значение транслятор при
+старте процесса переписывает от рабочего каталога хозяина: у init сразу
+chdir("/"), и относительный путь указал бы уже не туда).
+⚠️ Без GUEST_FWINIT=1 или без GUEST_PROP_LOG поведение ровно прежнее: таблица
+пуста, хук на read — одна проверка счётчика.
+
+Проверка: tests/qemu/fwinit.sh, случаи «7».
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -3396,9 +3396,18 @@
+     if (ret)
+         return ret;
+ 
++    /*
++     * ★ Режим «init прошивки» (патч 0080): сокет службы свойств init узнаём по
++     * ГОСТЕВОМУ пути — до перевода под корень, который перепишет addr.
++     */
++    bool fw_prop = guest_fwinit_prop_path(addr, addrlen);
++
+     addrlen = guest_unix_path(addr, addrlen, &unbuf);
+ 
+     ret = get_errno(bind(sockfd, addr, addrlen));
++    if (fw_prop && !is_error(ret)) {
++        guest_fwinit_prop_listener(sockfd);
++    }
+     /*
+      * ★ Привязать netlink гостю не дали — подставляем безвредный AF_UNIX за тем
+      * же номером дескриптора. Без этого netd прошивки 4.1 не запускается, а без
+@@ -3574,6 +3583,9 @@
+         socklen_t namecap = msg.msg_name ? msg.msg_namelen : 0;
+ 
+         ret = get_errno(safe_recvmsg(fd, &msg, flags));
++        if (!is_error(ret) && vec && !(flags & MSG_PEEK)) {
++            guest_fwinit_prop_iov(fd, vec, count, ret);            /* патч 0080 */
++        }
+         if (!is_error(ret)) {
+             /*
+              * ★★★ Подставной netlink: говорим, что ответ пришёл ОТ ЯДРА.
+@@ -3702,7 +3714,9 @@
+     }
+ 
+     if (target_addr == 0) {
+-        return get_errno(safe_accept4(fd, NULL, NULL, host_flags));
++        ret = get_errno(safe_accept4(fd, NULL, NULL, host_flags));
++        guest_fwinit_prop_accepted(fd, ret);        /* патч 0080 */
++        return ret;
+     }
+ 
+     /* linux returns EFAULT if addrlen pointer is invalid */
+@@ -3722,6 +3736,7 @@
+     ret_addrlen = addrlen;
+     ret = get_errno(safe_accept4(fd, addr, &ret_addrlen, host_flags));
+     if (!is_error(ret)) {
++        guest_fwinit_prop_accepted(fd, ret);        /* патч 0080 */
+         host_to_target_sockaddr(target_addr, addr, MIN(addrlen, ret_addrlen));
+         if (put_user_u32(ret_addrlen, target_addrlen_addr)) {
+             ret = -TARGET_EFAULT;
+@@ -3945,6 +3960,9 @@
+                 ret = -TARGET_EFAULT;
+                 goto fail;
+             }
++        }
++        if (host_msg && !(flags & MSG_PEEK)) {
++            guest_fwinit_prop_data(fd, host_msg, MIN(ret, len));   /* патч 0080 */
+         }
+         unlock_user(host_msg, msg, len);
+     } else {
+@@ -10566,6 +10584,9 @@
+             if (!(p = lock_user(VERIFY_WRITE, arg2, arg3, 0)))
+                 return -TARGET_EFAULT;
+             ret = get_errno(safe_read(arg1, p, arg3));
++            if (ret > 0) {
++                guest_fwinit_prop_data(arg1, p, ret);   /* патч 0080 */
++            }
+             if (ret >= 0 &&
+                 fd_trans_host_to_target_data(arg1)) {
+                 ret = fd_trans_host_to_target_data(arg1)(p, ret);
+@@ -10669,6 +10690,7 @@
+         guest_net_close(arg1);
+         guest_proc_close(arg1);
+         guest_oom_close(arg1);
++        guest_fwinit_prop_closed(arg1);             /* патч 0080 */
+         fd_trans_unregister(arg1);
+         return get_errno(close(arg1));
+ #if defined(__NR_close_range) && defined(TARGET_NR_close_range)

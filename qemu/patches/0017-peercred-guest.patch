@@ -1,0 +1,66 @@
+SO_PEERCRED отдаёт ГОСТЕВУЮ личность соседа: иначе зигота не пускает приложения.
+
+Симптом. Загрузка дошла до systemReady, и первый же запуск приложения обрывается:
+
+  I StatusBarManagerService Starting service: com.android.systemui/.StatusBarService
+  I Zygote   Process: zygote socket opened
+  E Zygote   Zygote security policy prevents request:
+  E Zygote   com.android.internal.os.ZygoteSecurityException: App UIDs may not
+             specify uid's or gid's
+        at com.android.internal.os.ZygoteConnection.applyUidSecurityPolicy(…:552)
+  E Process  Starting VM process through Zygote failed
+  E ActivityManager  Failure starting process com.android.systemui
+  E AndroidRuntime  *** FATAL EXCEPTION IN SYSTEM PROCESS: ActivityManager
+        java.lang.SecurityException: … without permission Service process is bad
+
+Причина. applyUidSecurityPolicy смотрит на SO_PEERCRED — НАСТОЯЩИЕ права
+соединившегося процесса, как их видит ядро хозяина. У нас это uid приложения
+(что-то вроде 10661), а не 1000, и зигота честно отказывает: приложениям
+задавать uid запуска не положено.
+
+Личность гостя мы уже ведём сами (патч 0010), но она была видна только своему
+процессу. Теперь каждый процесс qemu выкладывает её в файл, названный его
+ХОЗЯЙСКИМ номером процесса, а getsockopt(SO_PEERCRED) берёт номер из ответа
+ядра — он настоящий и указывает ровно на тот же процесс qemu — и подменяет
+uid/gid. Точный ответ без общего состояния и без рукопожатий в потоке данных.
+
+★ Отвечать «всегда root» было бы куда проще и НЕВЕРНО: это молча выключило бы
+все проверки прав просителя внутри гостя. Тихая подмена такого рода потом
+стоит часов.
+
+Каталог задаётся переменной GUEST_CREDS; нет её — возможность выключена, и
+SO_PEERCRED идёт как есть.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -2651,6 +2651,30 @@
+             }
+             if (!lock_user_struct(VERIFY_WRITE, tcr, optval_addr, 0)) {
+                 return -TARGET_EFAULT;
++            }
++            /*
++             * ★ Личность соседа — ГОСТЕВАЯ, а не хозяйская.
++             *
++             * Зигота решает, что вправе делать проситель, именно по
++             * SO_PEERCRED. Хозяин отдаёт uid приложения, и первый же запуск
++             * приложения обрывается:
++             *
++             *   E Zygote   ZygoteSecurityException: App UIDs may not specify
++             *              uid's or gid's
++             *   E ActivityManager  Failure starting process com.android.systemui
++             *
++             * Номер процесса в ответе ядра НАСТОЯЩИЙ и указывает ровно на тот
++             * процесс qemu, что соединился; по нему и находим его личность
++             * (см. linux-user/guest_ids.c). Если сведений нет — оставляем
++             * хозяйские, ничего не выдумывая.
++             */
++            {
++                int guid, ggid;
++
++                if (guest_ids_peercred(cr.pid, &guid, &ggid)) {
++                    cr.uid = guid;
++                    cr.gid = ggid;
++                }
+             }
+             __put_user(cr.pid, &tcr->pid);
+             __put_user(cr.uid, &tcr->uid);
