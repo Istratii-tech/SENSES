@@ -1,5 +1,7 @@
 # ISTRATII_TECH SENSES — QEMU source distribution
 
+[![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)]([https://t.me](https://t.me/istratii_tech ) [![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)]([https://discord.com](https://discord.gg/5HWuRWdKwt))
+
 This repository exists to satisfy the **GNU GPL version 2** obligations that
 come with distributing a modified QEMU.
 
