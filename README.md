@@ -10,6 +10,8 @@ an ARM64 phone by translating its individual processes — there is no guest
 kernel. The translator is a modified QEMU, and **that is what this repository
 contains**: our patches, our added source files, and the script that builds it.
 
+MADE WITH CLAUDE CODE
+
 Repository: `https://github.com/Istratii-tech/Senses`.
 Requests for sources: issues of this repository
 (`https://github.com/Istratii-tech/Senses/issues`) or `https://t.me/istratii_tech`.
