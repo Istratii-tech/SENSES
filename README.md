@@ -16,6 +16,26 @@ Repository: `https://github.com/Istratii-tech/Senses`.
 Requests for sources: issues of this repository
 (`https://github.com/Istratii-tech/Senses/issues`) or `https://t.me/istratii_tech`.
 
+## Instructions
+
+Инструкция как использовать SENSES Emulator
+
+1. Скачать прошивку которую хотите запустить
+2. Положить файл прошивки в папку ISTRAII_TECH SENSES в корне вашего телефона
+3. Запустить эмулятор (он сам может предложить распаковку) и нажать на нижней панели SENSES -> Fimware -> нажать плюс -> выбрать файл вашей прошивки -> нажать распаковать
+4. После распаковки нажимаете SENSES -> Start
+5. Для остановки нажимаете SENSES -> Stop
+
+How to Use SENSES Emulator: A Step-by-Step Guide
+
+1. Download the firmware you want to run
+2. Place the firmware file into the ISTRAII_TECH SENSES folder in the root directory of your phone
+3. Launch the emulator (it may automatically prompt you to extract the files) and follow these steps on the bottom panel:
+Tap SENSES -> Firmware -> tap the plus (+) icon
+Select your firmware file and tap Extract
+4. Once extracted, tap SENSES -> Start to begin
+5. To stop the emulator, tap SENSES -> Stop
+
 ## What is *not* here
 
 * **No firmware.** The application ships none, and neither does this
