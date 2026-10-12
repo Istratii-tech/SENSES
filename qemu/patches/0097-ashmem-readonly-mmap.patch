@@ -1,0 +1,148 @@
+Отображение области ashmem гостя «только чтение» — по описателю, переоткрытому только на чтение (Р-130).
+
+Симптом (09.10, прошивка 6.0, хозяин с ядром 4.9). Встроенный браузер прошивки (движок с
+собственным загрузчиком библиотек) не запускается: в журнале гостя
+
+  E libc  mmap fail (… size 4096, flags 0x1, errno 1 (Operation not permitted))   ×2
+  W <загрузчик библиотек движка>  This system cannot safely share RELRO sections
+
+и `System.loadLibrary(<движок>)` бросает UnsatisfiedLinkError «couldn't find <библиотека
+движка>» (в пакете лежит только её копия с приставкой для собственного загрузчика).
+Проверка собственного загрузчика движка (может ли он делить RELRO): область ashmem →
+отобразить на запись → ASHMEM_SET_PROT_MASK(PROT_READ) → отобразить PROT_READ с
+MAP_SHARED (ДОЛЖНО пройти) → отобразить на запись (ДОЛЖНО отказать).
+
+Причина. Область ashmem у гостя — memfd (guest_ashmem.c), а «только чтение»
+сужает печать на запись. memfd всегда открыт на чтение-запись, и на ядре хозяина
+ниже 5.1 (F_SEAL_FUTURE_WRITE там нет, ставится F_SEAL_WRITE) mmap(PROT_READ,
+MAP_SHARED) такого описателя ядро считает потенциально записываемым общим
+отображением и на запечатанной области отказывает EPERM (mapping_map_writable).
+
+Теперь do_mmap перед настоящим mmap спрашивает шим (guest_ashmem_mmap_prep): для
+отображения «только чтение» запечатанной области он отдаёт описатель, переоткрытый
+open("/proc/self/fd/N", O_RDONLY) — у него нет права записи, отображение проходит,
+страницы те же; описатель закрывается после mmap. Где переоткрыть нельзя (Р-130б:
+SELinux хозяина-Android не даёт приложению open() файлов appdomain_tmpfs по пути,
+отказ EACCES — замерено на ядре 4.9), шим просит отобразить область как MAP_PRIVATE
+с теми же правами: печать F_SEAL_WRITE частному отображению не мешает, содержимое то
+же (страницы общие с файлом, пока в них не писали, а писать в запечатанную область
+уже нельзя); do_mmap заменяет тип отображения. Отображение на запись области
+«только чтение» остаётся отказом EPERM (его даёт ядро; если печать не встала,
+потому что запись уже отображена, а F_SEAL_FUTURE_WRITE на ядре нет, — шим по
+маске в своей таблице). Чужие отображения (не MAP_SHARED, не наш memfd) не
+затрагиваются.
+
+Р-130в. Третий шаг той же проверки движка браузера ((«описатель только на чтение?»))
+пробует mprotect(PROT_READ|PROT_WRITE) по отображению «только чтение» и считает «делить
+RELRO нельзя», если mprotect ПРОШЁЛ: у настоящего ashmem (и у ядра с печатью) отображение
+без VM_MAYWRITE, mprotect на запись отказывает EACCES. У подмены MAP_PRIVATE хозяин разрешал
+бы (копия при записи). Поэтому шим помнит гостевые диапазоны, отображённые подменой, а
+хуки здесь ведут таблицу и отказывают: mmap — после успеха с ответом 2 записывает диапазон,
+MAP_FIXED поверх вычитает перекрытие; munmap — вычитает (запись режется); mremap — после
+успеха вычитает старое и, если оно было записано целиком, записывает новое место;
+mprotect — запись к ЛЮБОЙ части записанного диапазона отказывает -EACCES без изменений.
+Пока таблица пуста, хуки стоят одной атомарной проверки.
+
+Сам код — в qemu/src/guest_ashmem.c (объявления приезжают через guest_binder.h,
+который syscall.c уже включает); патч вешает вызовы.
+
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -6383,7 +6383,48 @@
+     }
+     host_flags |= target_to_host_bitmask(target_flags, mmap_flags_tbl);
+ 
+-    return get_errno(target_mmap(addr, len, prot, host_flags, fd, offset));
++    /*
++     * ★★★★★ Р-130, Р-130б, Р-130в: область ashmem гостя (наш memfd) отображается «как у
++     * ashmem»: на ядре хозяина < 5.1 `mmap(PROT_READ, MAP_SHARED)` запечатанной на запись
++     * области по описателю, открытому на запись, отказывает EPERM, и проверка
++     * «делить RELRO» во встроенном браузере прошивки проваливается. Для такого
++     * отображения шим отдаёт описатель, переоткрытый только на чтение (его
++     * закрываем после mmap), а где это нельзя (SELinux хозяина-Android не даёт
++     * open() файлов appdomain_tmpfs по пути) — просит отобразить как MAP_PRIVATE:
++     * печать частному отображению не мешает, содержимое то же. Такой диапазон шим
++     * запоминает (guest_ashmem_range_note; так же — отображение «только чтение»
++     * области без печати, права которой держит маска шима, ответ 3): mprotect на
++     * запись по нему — EACCES, как у ashmem (см. хук mprotect ниже). Отображение на запись области «только
++     * чтение» — EPERM. MAP_FIXED поверх чего-то вычитает перекрытие из записей.
++     * Подробности — у guest_ashmem_mmap_prep (guest_ashmem.c).
++     */
++    {
++        abi_long mret;
++        int afd = fd, rfd = -1, prep;
++
++        prep = fd >= 0 ? guest_ashmem_mmap_prep(fd, prot, host_flags, &rfd) : 0;
++        if (prep < 0) {
++            return -host_to_target_errno(errno);
++        }
++        if (prep == 1) {
++            afd = rfd;
++        } else if (prep == 2) {
++            host_flags = (host_flags & ~MAP_TYPE) | MAP_PRIVATE;
++        }
++        mret = get_errno(target_mmap(addr, len, prot, host_flags, afd, offset));
++        if (afd != fd) {
++            close(afd);
++        }
++        if (!is_error(mret)) {
++            if (host_flags & MAP_FIXED) {
++                guest_ashmem_range_forget((abi_ulong)mret, (abi_ulong)len);
++            }
++            if (prep == 2 || prep == 3) {
++                guest_ashmem_range_note((abi_ulong)mret, (abi_ulong)len);
++            }
++        }
++        return mret;
++    }
+ }
+ 
+ /*
+@@ -12340,7 +12381,15 @@
+ #endif
+     case TARGET_NR_munmap:
+         arg1 = cpu_untagged_addr(cpu, arg1);
+-        return get_errno(target_munmap(arg1, arg2));
++        {
++            /* ★ Р-130в: снятое отображение больше не «наше» (подмена MAP_PRIVATE ashmem) */
++            abi_long mret = get_errno(target_munmap(arg1, arg2));
++
++            if (!is_error(mret)) {
++                guest_ashmem_range_forget((abi_ulong)arg1, (abi_ulong)arg2);
++            }
++            return mret;
++        }
+     case TARGET_NR_mprotect:
+         arg1 = cpu_untagged_addr(cpu, arg1);
+         {
+@@ -12354,12 +12403,29 @@
+                 arg1 = ts->info->stack_limit;
+             }
+         }
++        /*
++         * ★ Р-130в: запись к отображению запечатанной области ashmem, сделанному подменой
++         * MAP_PRIVATE, — EACCES без изменений (как у ashmem; от этого зависит проверка движка браузера).
++         */
++        if (guest_ashmem_mprotect_denied((abi_ulong)arg1, (abi_ulong)arg2, (int)arg3)) {
++            return -TARGET_EACCES;
++        }
+         return get_errno(target_mprotect(arg1, arg2, arg3));
+ #ifdef TARGET_NR_mremap
+     case TARGET_NR_mremap:
+         arg1 = cpu_untagged_addr(cpu, arg1);
+         /* mremap new_addr (arg5) is always untagged */
+-        return get_errno(target_mremap(arg1, arg2, arg3, arg4, arg5));
++        {
++            /* ★ Р-130в: перенесённое отображение подмены MAP_PRIVATE остаётся под отказом mprotect на запись */
++            int cov = guest_ashmem_range_covers((abi_ulong)arg1, (abi_ulong)arg2);
++            abi_long mret = get_errno(target_mremap(arg1, arg2, arg3, arg4, arg5));
++
++            if (!is_error(mret)) {
++                guest_ashmem_range_moved((abi_ulong)arg1, (abi_ulong)arg2, (abi_ulong)mret,
++                                         (abi_ulong)(arg3 < arg2 ? arg3 : arg2), cov);
++            }
++            return mret;
++        }
+ #endif
+         /* ??? msync/mlock/munlock are broken for softmmu.  */
+ #ifdef TARGET_NR_msync

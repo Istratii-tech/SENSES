@@ -9,7 +9,7 @@
 // Everything changed in QEMU is listed in NOTICE.
 //
 // Copyright (c) 2026 istratiitech <https://github.com/istratiitech>
-// Changed: 2026-08-29
+// Changed: 2026-08-29 … 2026-10-09
 
 /* guest_fs.h — подмена сведений о разделе для гостя. */
 #ifndef GUEST_FS_H
@@ -17,6 +17,7 @@
 
 struct statfs;
 void guest_fs_fake(const char *path, struct statfs *st);
-int guest_fs_try_open(const char *path, int *fd);
+/* Открытие по ГОСТЕВОМУ имени; [flags] — флаги открытия гостя (хозяйские: O_NONBLOCK, O_CLOEXEC, режим доступа). 1 — наш путь, в *fd результат. */
+int guest_fs_try_open(const char *path, int flags, int *fd);
 
 #endif

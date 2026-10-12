@@ -9,7 +9,7 @@
 // Everything changed in QEMU is listed in NOTICE.
 //
 // Copyright (c) 2026 istratiitech <https://github.com/istratiitech>
-// Changed: 2026-08-29 … 2026-10-05
+// Changed: 2026-08-29 … 2026-10-11
 
 // guest_input.c — поддельный сенсорный экран гостя: /dev/input/event0.
 //
@@ -174,6 +174,13 @@ static void in_path_init(void)
  *
  * ⚠️ Переключается ТОЛЬКО до запуска системы: EventHub опрашивает устройство
  * один раз, при обходе /dev/input.
+ *
+ * ★ Р-145: сам он нужен не только руками. Android 1.5/1.6 мультитача не знают:
+ * их EventHub (libui) считает экраном устройство с ABS_X и ABS_Y, а устройство с
+ * одними ABS_MT_* — клавиатурой (`classes=0x1` в журнале гостя), и касания до
+ * гостя не доходят. Переменную ставит стенд (Vm.guestTouchEnv) по УЛИКЕ в
+ * прошивке — в ней нет разбора мультитача, — а не по номеру поколения;
+ * `cmd st:1|0` перекрывает улику, `cmd st:auto` возвращает её.
  */
 static int in_single(void)
 {

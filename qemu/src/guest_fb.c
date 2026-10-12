@@ -9,7 +9,7 @@
 // Everything changed in QEMU is listed in NOTICE.
 //
 // Copyright (c) 2026 istratiitech <https://github.com/istratiitech>
-// Changed: 2026-08-29 … 2026-09-07
+// Changed: 2026-08-29 … 2026-10-11
 
 /* guest_fb.c — ioctl кадрового буфера для гостя.
  *
@@ -36,8 +36,35 @@
  * просто копирует кадр в отображённую область), и приложению не нужно знать,
  * какая половина буфера сейчас показывается. Ценой возможного разрыва картинки
  * — зато без рассинхрона, который иначе пришлось бы отлаживать на живом экране.
- * Переключение страниц можно будет включить, когда появится настоящая
- * вертикальная синхронизация.
+ *
+ * ★★ Р-144: ДВЕ СТРАНИЦЫ — только по просьбе стенда, переменной GUEST_FB_FLIP.
+ * Её стенд ставит, когда композитор гостя рисует программно ПРЯМО в fb0 и
+ * кадр показывает вид гостя (путь «кадровый буфер», у 1.x: загрузчик EGL до
+ * моста не доходит). Композитор 1.x просит `yres_virtual = 2·yres` и, получив
+ * отказ, пишет «page flipping not supported» и рисует в запасной буфер, а на
+ * каждом кадре копирует его в fb0 целиком (300 КБ при 320x480) — копия под
+ * трансляцией и разрыв, если вид гостя читает посреди копии. С переменной:
+ *   * FBIOGET/FBIOPUT_VSCREENINFO отвечают `yres_virtual = 2·yres`, yoffset —
+ *     показываемая страница; smem_len — обе страницы (файл стенд и так заводит
+ *     на два кадра, Vm.FB_BYTES);
+ *   * FBIOPUT_VSCREENINFO и FBIOPAN_DISPLAY с yoffset 0 или yres переключают
+ *     показываемую страницу (1.x листает именно FBIOPUT_VSCREENINFO с
+ *     FB_ACTIVATE_VBL, gralloc 2.3+ — FBIOPAN_DISPLAY);
+ *   * какая страница показана, транслятор пишет в файл листания стенда — путь
+ *     в самой переменной (хозяйский, вне дерева гостя): 16 байт, четыре слова
+ *     little-endian {знак FB_FLIP_MAGIC, страница, номер листания, страниц}.
+ *     Номер листания растёт на каждое переключение — по нему вид гостя
+ *     (GuestView.kt) берёт новый кадр без сверки отпечатка, из той половины,
+ *     которую гость велел показать. Файл общий для всех процессов гостя:
+ *     номер читается из него (pread) и пишется назад, а описатель на миг —
+ *     открыл, прочёл, записал, закрыл: гость наших описателей не видит.
+ * Без переменной (мост, 2.3+) всё как было: одна страница, `yres_virtual =
+ * yres`, FBIOPAN_DISPLAY ничего не делает.
+ *
+ * ⚠️ Вертикальной развёртки нет: FB_ACTIVATE_VBL здесь не ждёт её, а
+ * переключает сразу. Окно разрыва остаётся — вид гостя копирует показанную
+ * страницу (доли миллисекунды), а композитор как раз начинает рисовать в неё
+ * следующий кадр, — но оно на порядки уже копии целого кадра в одну страницу.
  *
  * ⚠️ Формат задаётся ЗДЕСЬ, и приложение обязано показывать буфер тем же
  * форматом (Bitmap.Config.RGB_565). Разойдётся — картинка сдвоится или цвета
@@ -116,6 +143,17 @@ QEMU_BUILD_BUG_ON(sizeof(struct target_fb_fix_screeninfo) != 68);
 static int fb_geom_done;
 static int fb_w = 480, fb_h = 800, fb_mm_w = 56, fb_mm_h = 94;
 
+/*
+ * ★ Р-144: листание страниц (см. шапку). fb_flip — путь файла листания из
+ * GUEST_FB_FLIP (NULL — одна страница, как прежде); fb_pages — 1 или 2;
+ * fb_page — показываемая страница по мнению ЭТОГО процесса (FBIOGET отвечает
+ * ею; общий номер листания живёт в файле).
+ */
+#define FB_FLIP_MAGIC 0x50494c46u      /* «FLIP» little-endian */
+static const char *fb_flip;
+static int fb_pages = 1;
+static int fb_page;
+
 static int env_int(const char *name, int dflt)
 {
     const char *s = getenv(name);
@@ -140,6 +178,64 @@ static void fb_geom_init(void)
      * иначе гость посчитал бы себе неверные dpi. */
     fb_mm_w = env_int("GUEST_FB_MM_W", fb_w * 254 / 2170);
     fb_mm_h = env_int("GUEST_FB_MM_H", fb_h * 254 / 2170);
+    const char *flip = getenv("GUEST_FB_FLIP");
+    if (flip && flip[0] == '/') {
+        fb_flip = flip;
+        fb_pages = 2;
+    }
+}
+
+/*
+ * ★ Р-144: показать страницу [page] — запомнить и записать в файл листания
+ * {знак, страница, номер листания + 1, страниц}. Номер — из файла: гостевых
+ * процессов, листающих один fb0, может быть несколько (перезапуск
+ * композитора), и счёт обязан расти, а не начинаться с нуля. Сбой открытия
+ * или записи — молча: вид гостя тогда покажет страницу 0 по отпечатку, как
+ * при одной странице (хуже, но не черно).
+ */
+static void fb_show_page(int page)
+{
+    uint32_t w[4] = { 0, 0, 0, 0 };
+
+    fb_page = page;
+    if (!fb_flip) {
+        return;
+    }
+    int f = open(fb_flip, O_RDWR | O_CLOEXEC);
+    if (f < 0) {
+        return;
+    }
+    if (pread(f, w, sizeof w, 0) != (ssize_t)sizeof w || w[0] != FB_FLIP_MAGIC) {
+        w[2] = 0;                      /* файл свежий (нули от стенда) — счёт с нуля */
+    }
+    w[0] = FB_FLIP_MAGIC;
+    w[1] = (uint32_t)page;
+    w[2] += 1;
+    w[3] = (uint32_t)fb_pages;
+    if (pwrite(f, w, sizeof w, 0) != (ssize_t)sizeof w) {
+        /* не записалось — вид гостя останется на отпечатке страницы 0 */
+    }
+    close(f);
+}
+
+/*
+ * ★ Р-144: yoffset из гостевой fb_var_screeninfo (все поля __u32, раскладка
+ * гостя совпадает с хозяйской: xres, yres, xres_virtual, yres_virtual,
+ * xoffset, yoffset — шестое слово). Только 0 и yres — страницы; прочее
+ * (у композитора таких нет) не трогает показ: -1.
+ */
+static int fb_page_of(abi_ulong arg)
+{
+    struct fb_var_screeninfo v;
+
+    memcpy(&v, g2h_untagged(arg), sizeof v);
+    if (v.yoffset == 0) {
+        return 0;
+    }
+    if (fb_pages == 2 && v.yoffset == (uint32_t)fb_h) {
+        return 1;
+    }
+    return -1;
 }
 
 #define FB_W      fb_w
@@ -225,7 +321,9 @@ static void fill_var(struct fb_var_screeninfo *v)
     v->xres = FB_W;
     v->yres = FB_H;
     v->xres_virtual = FB_W;
-    v->yres_virtual = FB_H;            /* без двойной буферизации, см. шапку */
+    /* Одна страница — без двойной буферизации; две — только по GUEST_FB_FLIP (Р-144, см. шапку). */
+    v->yres_virtual = FB_H * fb_pages;
+    v->yoffset = (uint32_t)(fb_page * FB_H);
     v->bits_per_pixel = FB_BPP;
     /* RGB565: синий в младших битах, красный в старших — как на живом экране. */
     v->red.offset = 11; v->red.length = 5;
@@ -318,7 +416,8 @@ static void fill_fix(struct target_fb_fix_screeninfo *f)
     memset(f, 0, sizeof *f);
     snprintf(f->id, sizeof f->id, "guestfb");
     f->smem_start = 0;                 /* физического адреса у нас нет */
-    f->smem_len = FB_W * FB_H * (FB_BPP / 8);
+    f->smem_len = FB_W * FB_H * (FB_BPP / 8) * fb_pages;
+    f->ypanstep = fb_pages > 1 ? 1 : 0;   /* Р-144: листать можно только при двух страницах */
     f->type = FB_TYPE_PACKED_PIXELS;
     f->visual = FB_VISUAL_TRUECOLOR;
     f->line_length = FB_W * (FB_BPP / 8);
@@ -362,14 +461,34 @@ int guest_fb_ioctl(int fd, unsigned long req, abi_ulong arg, abi_long *ret)
          * ему ту геометрию, которая ДЕЙСТВИТЕЛЬНО есть: gralloc.default читает
          * структуру обратно и по ней считает line_length и смещение страницы.
          * Промолчать нельзя — он поверит своим числам и уедет за буфер.
+         *
+         * ★ Р-144: при двух страницах yoffset просьбы — страница к показу
+         * (композитор 1.x листает именно этим вызовом, FB_ACTIVATE_VBL).
          */
+        fb_geom_init();
+        if (fb_pages == 2) {
+            int page = fb_page_of(arg);
+            if (page >= 0) {
+                fb_show_page(page);
+            }
+        }
         struct fb_var_screeninfo v;
         fill_var(&v);
         memcpy(g2h_untagged(arg), &v, sizeof v);
         return 1;
     }
     case FBIOPAN_DISPLAY:
-        /* Страница одна, переключать нечего. */
+        /* Одна страница — переключать нечего. ★ Р-144: две — показать yoffset. */
+        fb_geom_init();
+        if (fb_pages == 2) {
+            int page = fb_page_of(arg);
+            if (page < 0) {
+                errno = EINVAL;        /* соглашение шима: *ret = -1 и errno хозяина (патч 0006) */
+                *ret = -1;
+                return 1;
+            }
+            fb_show_page(page);
+        }
         return 1;
     case GUEST_FBIO_WAITFORVSYNC:
         /*

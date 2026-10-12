@@ -94,7 +94,7 @@ FRESH=1 после любой правки. Новый файл — дописа
 +    {
 +        int bfd;
 +
-+        if (guest_binder_try_open(fname, &bfd)) {
++        if (guest_binder_try_open(fname, flags, &bfd)) {
 +            return bfd < 0 ? -host_to_target_errno(errno) : bfd;
 +        }
 +    }

@@ -132,7 +132,7 @@ set -eu
 VER=$VER
 FRESH=${FRESH:-0}
 # ★ Диапазон дат наших изменений — для пометок по GPLv2 §2a (см. ниже).
-CHANGED_DATES='2026-08-29 … 2026-10-05'
+CHANGED_DATES='2026-08-29 … 2026-10-11'
 QEMU_SHA256=$QEMU_SHA256
 ALPINE_ROOTFS=$ALPINE_ROOTFS
 ALPINE_SHA256=$ALPINE_SHA256
@@ -341,6 +341,9 @@ mkdir -p "$PROJ/qemu/build"
 sudo cp -f "$ALP/root/out/qemu-arm" "$PROJ/qemu/build/qemu-arm-android"
 sudo cp -f "$ALP/root/out/qemu-arm-dbg" "$PROJ/qemu/build/qemu-arm-android-dbg"
 sudo cp -f "$ALP/root/out/BUILD-MANIFEST.txt" "$PROJ/qemu/build/BUILD-MANIFEST.txt"
+# ★ Выпуск 2 (Л-2): сумма самого сценария сборки — в конец манифеста (внутри chroot его нет: он запускается снаружи). Заставу «переводчик собран из этого дерева»
+# (tools/mkgplbundle.sh, застава 7) сверяет её с qemu/build-android.sh комплекта, как суммы патчей и наших файлов.
+{ echo; echo "== build script, sha256"; echo "$(sha256_of "$PROJ/qemu/build-android.sh")  build-android.sh"; } | sudo tee -a "$PROJ/qemu/build/BUILD-MANIFEST.txt" >/dev/null
 sudo chmod 644 "$PROJ/qemu/build/BUILD-MANIFEST.txt"
 sudo chmod 755 "$PROJ/qemu/build/qemu-arm-android" "$PROJ/qemu/build/qemu-arm-android-dbg"
 ls -l "$PROJ/qemu/build/qemu-arm-android"

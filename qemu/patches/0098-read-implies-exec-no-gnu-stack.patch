@@ -1,0 +1,180 @@
+Личность READ_IMPLIES_EXEC у программ без PT_GNU_STACK — читаемая память исполнима, как у ядра ARM (Р-141).
+
+Симптом (10.10, телефон, прошивки Android 1.6 и 1.5). Система доходит до
+композитора и в тот же миг теряет экран: статус NO_GRAPHICS, в журнале стенда —
+SIGSEGV процесса surfaceflinger. Отчёт транслятора:
+
+  PC=0x00010a88 [гость: rw-] в 0000a000-00012000 rw-p      (анонимная память сразу за
+                                                           программой, загруженной с 0x8000)
+  у PC: stmfd sp!, {r4-r7,lr} …                            (пролог функции —
+                                                           настоящий код ARM)
+  след: libpixelflinger.so ← libsurfaceflinger.so ← libagl.so
+
+То есть код породил на лету сам PixelFlinger (генератор кода софтовой отрисовки),
+положил его в обычную память (кучу) и прыгнул в неё.
+
+Причина. У surfaceflinger, app_process и libpixelflinger.so прошивки 1.6 в
+заголовках программы НЕТ PT_GNU_STACK (так собраны 1.5 и 1.6; у 4.0.3 и всех
+4.x+ он есть, RW). Ядро ARM (arch/arm/kernel/elf.c, arm_elf_read_implies_exec)
+у такой программы (executable_stack == EXSTACK_DEFAULT) ставит личность
+READ_IMPLIES_EXEC: mm/mmap.c (do_mmap) и mm/mprotect.c прибавляют PROT_EXEC каждому
+отображению и каждой смене прав, где есть PROT_READ, а VM_DATA_DEFAULT_FLAGS (куча
+brk) и стек исполняемы по тем же умолчаниям. На настоящем аппарате прыжок в кучу
+поэтому работал. QEMU 8.2.4 личность не изображает: в linux-user/elfload.c есть
+только имя флага READ_IMPLIES_EXEC в перечне personality.h (никто его не читает),
+а syscall personality передаётся ХОЗЯИНУ и на гостевые страницы не влияет. Единственная
+уступка — стек: EXSTACK_DEFAULT для ARM равен true, поэтому стек программы без
+PT_GNU_STACK исполним уже сейчас; куча и анонимные отображения — нет (PAGE_EXEC
+не выставлен, выборка команды отказывает SIGSEGV).
+
+Починка — не вторая система, а то, чего не хватало первой: загрузчик ELF
+запоминает, был ли у ГЛАВНОЙ программы PT_GNU_STACK (решает главная: так у
+ядра; интерпретатор — линкер — и vdso грузятся с pinterp_name == NULL и роли не
+играют), и ставит флаг ДО отображения её сегментов (target_set_read_implies_exec).
+target_mmap и target_mprotect — единственная воронка гостевых прав: через неё идут
+mmap/mmap2, mprotect, brk (do_brk зовёт target_mmap) и сами сегменты ELF — прибавляют
+PROT_EXEC всякому запросу, где есть PROT_READ (ровно правило ядра; PROT_WRITE без
+PROT_READ исполнения не получает). Хозяину права не меняются: target_to_host_prot
+исполнение хозяйской странице не даёт (транслятор исполняет гостевой код сам), меняется
+только PAGE_EXEC страниц гостя.
+
+Процесс один на всё: потоки делят флаг, fork его наследует, execve заводит новый
+процесс qemu (патч 0005) и считает заново по заголовкам новой программы.
+
+Самоизменяющийся код. Страница, из которой уже переводились блоки, теперь может быть
+ещё и записываемой — это обычное дело для JIT (Dalvik, движок JavaScript), и ловушка на
+запись (SMC) её ведёт: PixelFlinger переписывает то же место и зовёт cacheflush
+(ARM_NR_cacheflush, патч 0009 — возвращает 0). tests/qemu/rie.sh гоняет три такие
+последовательности (перезапись кода в куче, то же с записью данных в ТУ ЖЕ страницу,
+то же на анонимной) — все ответы верны.
+
+⚠️ Программы С PT_GNU_STACK (все 4.x+, рабочие прошивки) не затронуты: флаг у них не
+ставится, ни одной новой исполняемой страницы (проверка: права страниц в /proc/self/maps и
+число исполняемых отображений — tests/qemu/rie.sh, случай 3). PT_GNU_STACK с флагом X
+(«стек исполняемый») — как прежде: исполняется только стек; ядро прибавило бы PROT_EXEC и
+там, но правка нужна только для отсутствия заголовка, остальное не трогаем.
+
+Строка в журнал слежки (GUEST_PAGE_LOG; без неё — ни одной лишней команды): «личность
+READ_IMPLIES_EXEC: у программы … нет PT_GNU_STACK …» — одна на процесс, у программы с
+PT_GNU_STACK её нет. Проверки — tests/qemu/rie.sh (в ВМ, под фильтром песочницы Android 9; на
+сборке без патча краснеют 1а, 2а, 5а, 5б, 7а, 8а) и native/test/check_rie_wiring.py (на Маке:
+правило прав — функции патча дословно, проводка — по тексту патча).
+
+--- a/linux-user/mmap.c
++++ b/linux-user/mmap.c
+@@ -166,6 +166,55 @@
+            (prot & PROT_EXEC ? PROT_READ : 0);
+ }
+ 
++/*
++ * ★★★★★ Р-141: личность READ_IMPLIES_EXEC у программы БЕЗ PT_GNU_STACK.
++ *
++ * Ядро ARM (arch/arm/kernel/elf.c, arm_elf_read_implies_exec) ставит её каждой
++ * программе, в которой нет заголовка PT_GNU_STACK (executable_stack ==
++ * EXSTACK_DEFAULT: так собраны программы 1.5 и 1.6). Дальше mm/mmap.c
++ * (do_mmap) и mm/mprotect.c прибавляют PROT_EXEC каждому отображению и каждой
++ * смене прав, где есть PROT_READ; куча brk и стек исполняемы по тем же
++ * умолчаниям. Старый PixelFlinger (композитор 1.5/1.6) кладёт порождённый код
++ * в обычную память — в кучу — и прыгает в неё; у нас такая страница была `rw-`,
++ * и композитор умирал с SIGSEGV (экран NO_GRAPHICS).
++ *
++ * Здесь то же правило, в ЕДИНСТВЕННОЙ воронке прав — target_mmap и
++ * target_mprotect: через них идут mmap/mmap2, mprotect, brk (do_brk зовёт
++ * target_mmap), сегменты самого загрузчика ELF. Хозяину права не меняются
++ * (target_to_host_prot исполнение хозяйской странице не даёт; транслятор
++ * исполняет гостевой код сам) — меняется только PAGE_EXEC страниц гостя.
++ *
++ * Личность ставит загрузчик (elfload.c) по ГЛАВНОЙ программе, до отображения её
++ * сегментов; интерпретатор (линкер) роли не играет — как у ядра. Процесс — один
++ * на всё: потоки делят флаг, fork его наследует, execve заводит новый процесс
++ * qemu и считает заново по заголовкам новой программы.
++ *
++ * ⚠️ Программы С PT_GNU_STACK (все 4.x+) не затронуты: флаг у них не ставится,
++ * и ни одной новой исполняемой страницы не появляется.
++ * ⚠️ Ядро добавляет PROT_EXEC и при PT_GNU_STACK с флагом X; здесь НЕТ: у такой
++ * программы исполняемым остаётся только стек (как до патча) — Р-141 лечит
++ * только отсутствие заголовка.
++ */
++static bool guest_read_implies_exec;
++
++void target_set_read_implies_exec(bool on, const char *image_name)
++{
++    guest_read_implies_exec = on;
++    if (on && guest_plog_on()) {
++        guest_plog("личность READ_IMPLIES_EXEC: у программы %s нет PT_GNU_STACK — "
++                   "читаемые страницы (куча, анонимные и файловые отображения) "
++                   "исполняемы, как у ядра ARM", image_name);
++    }
++}
++
++static inline int guest_rie_prot(int prot)
++{
++    if (guest_read_implies_exec && (prot & PROT_READ)) {
++        prot |= PROT_EXEC;
++    }
++    return prot;
++}
++
+ /* NOTE: all the constants are the HOST ones, but addresses are target. */
+ int target_mprotect(abi_ulong start, abi_ulong len, int target_prot)
+ {
+@@ -180,6 +229,7 @@
+     if ((start & ~TARGET_PAGE_MASK) != 0) {
+         return -TARGET_EINVAL;
+     }
++    target_prot = guest_rie_prot(target_prot);        /* ★ Р-141 */
+     page_flags = validate_prot_to_pageflags(target_prot);
+     if (!page_flags) {
+         return -TARGET_EINVAL;
+@@ -518,6 +568,7 @@
+         goto fail;
+     }
+ 
++    target_prot = guest_rie_prot(target_prot);        /* ★ Р-141 */
+     page_flags = validate_prot_to_pageflags(target_prot);
+     if (!page_flags) {
+         errno = EINVAL;
+--- a/linux-user/user-internals.h
++++ b/linux-user/user-internals.h
+@@ -59,6 +59,8 @@
+ int info_is_fdpic(struct image_info *info);
+ 
+ void target_set_brk(abi_ulong new_brk);
++/* ★ Р-141: личность READ_IMPLIES_EXEC (живёт в mmap.c; ставит загрузчик ELF по главной программе). */
++void target_set_read_implies_exec(bool on, const char *image_name);
+ void syscall_init(void);
+ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
+                     abi_long arg2, abi_long arg3, abi_long arg4,
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -3276,6 +3276,7 @@
+     g_autofree struct elf_phdr *phdr = NULL;
+     abi_ulong load_addr, load_bias, loaddr, hiaddr, error;
+     int i, prot_exec;
++    bool has_gnu_stack = false;
+     Error *err = NULL;
+ 
+     /*
+@@ -3376,9 +3377,22 @@
+             }
+         } else if (eppnt->p_type == PT_GNU_STACK) {
+             info->exec_stack = eppnt->p_flags & PF_X;
++            has_gnu_stack = true;
+         }
+     }
+ 
++    /*
++     * ★★★★★ Р-141: нет PT_GNU_STACK у ГЛАВНОЙ программы → личность
++     * READ_IMPLIES_EXEC, как у ядра ARM (разбор — над
++     * target_set_read_implies_exec в mmap.c). Решает главная программа: только
++     * у неё pinterp_name не NULL (интерпретатор и vdso грузятся с NULL).
++     * Ставится ДО отображения сегментов, чтобы и они получили исполнение — как
++     * у ядра, которое ставит личность до elf_map.
++     */
++    if (pinterp_name != NULL) {
++        target_set_read_implies_exec(!has_gnu_stack, image_name);
++    }
++
+     load_addr = loaddr;
+ 
+     if (pinterp_name != NULL) {

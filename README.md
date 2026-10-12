@@ -1,9 +1,9 @@
-# ISTRATII_TECH SENSES — QEMU source distribution
+# SENSES — QEMU source distribution
 
 This repository exists to satisfy the **GNU GPL version 2** obligations that
 come with distributing a modified QEMU.
 
-The `ISTRATII_TECH SENSES` Android application runs an ARM32 Android system on
+The `SENSES` Android application runs an ARM32 Android system on
 an ARM64 phone by translating its individual processes — there is no guest
 kernel. The translator is a modified QEMU, and **that is what this repository
 contains**: our patches, our added source files, and the script that builds it.
@@ -29,6 +29,20 @@ have a modified copy of it made on your own device. The application changes
 that copy on the device (patched code, re-signed packages with a key generated
 on the device, removed vendor modules) and runs a local TLS proxy whose root
 certificate is generated on the device and added to the trust store of the copy.
+When the firmware's own installer has a menu, the application answers its
+screens with the default choices, as a person pressing "Next" would — except the
+agreement screen: the application shows you that agreement in full before
+unpacking, and you accept it or not (the application never accepts it for you; if
+you do not, nothing is unpacked and nothing is created, and the application says
+before the first start where it finds such a screen). Your acceptance is recorded
+in the container on your device; unpacking the same firmware again in place asks
+again unless it is recorded. The first-run wizard of the firmware is not skipped
+either: you go through it, and its agreements, yourself; it can be turned off only
+by hand, after you confirm that you have studied the agreements of the firmware
+and accept them. By starting a firmware in the application you confirm that you
+have read and accept the terms of that firmware and of the software inside it.
+These changes are made for compatibility only; they do not remove copy
+protection, DRM, licence checks of applications or account protection.
 Nothing is sent anywhere. Details: `NOTICE`, section 5.
 
 ## Building
@@ -58,8 +72,9 @@ The packages installed into that root are the ones Alpine `v3.20` serves on the
 day of the build, so the script records exactly what it used. When it finishes
 it writes `qemu/build/BUILD-MANIFEST.txt`: the QEMU version and archive sum, the
 Alpine root and its sum, the output of `apk info -v` in the chroot, the compiler
-version, the number of patches with the sha256 of each, and the sha256 of the
-resulting binary. Keep that file together with the binary you distribute.
+version, the number of patches with the sha256 of each, the sha256 of every file
+of ours and of the build script itself, and the sha256 of the resulting binary.
+Keep that file together with the binary you distribute.
 
 To build another QEMU version or another Alpine root you must give its checksum
 as well (`VER`, `QEMU_SHA256`, `BR`, `ALPINE_ROOTFS`, `ALPINE_SHA256`); the
@@ -72,7 +87,7 @@ COPYING                 GNU GPL version 2, full text
 NOTICE                  what is third-party, under which licence, where its source is
 licenses/               licence texts of the other third-party components
 qemu/build-android.sh   downloads upstream QEMU, applies patches, builds
-qemu/patches/           94 patches against QEMU 8.2.4
+qemu/patches/           97 patches against QEMU 8.2.4
 qemu/src/               39 files we added to linux-user/, GPL-2.0-or-later
 ```
 
@@ -88,6 +103,14 @@ usually more useful than the diff itself.
   `licenses/musl-COPYRIGHT.txt`), zlib (`licenses/zlib.txt`), libgcc (GPL-3.0
   or later with the GCC Runtime Library Exception). Versions and where to get
   their sources: `NOTICE`, section 1.3.
+* **libarchive, liblzma and libbz2** (linked statically into the helper `libunarc.so`,
+  a separate process) — libarchive: BSD-2-Clause with the notices of a few
+  individual files, `licenses/libarchive-COPYING.txt`; liblzma: BSD Zero Clause
+  License, `licenses/liblzma-0BSD.txt`; libbz2: `licenses/bzip2-LICENSE.txt`.
+  Versions, source archives and their sums: `NOTICE`, section 2.3.
+* **Start-up code of the C library of the Android NDK** (in the programs of the
+  phone side) — BSD licence of The Android Open Source Project.
+  `licenses/AndroidNDK-BSD.txt`.
 * **Bouncy Castle 1.70** — Bouncy Castle Licence. `licenses/BouncyCastle.txt`.
 * **Kotlin standard library and JetBrains annotations** — Apache License 2.0.
   `licenses/Apache-2.0.txt`.

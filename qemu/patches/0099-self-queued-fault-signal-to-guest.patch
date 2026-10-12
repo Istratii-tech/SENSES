@@ -1,0 +1,236 @@
+Сигнал самому себе через очередь (rt_tgsigqueueinfo, rt_sigqueueinfo) с кодом > 0 — гостю, а не хозяину (Р-149).
+
+Симптом (11.10, телефон, прошивка 7.1.2, №17). Композитор умирает через 48 с после
+того, как взял экран; в его журнале одна строка транслятора и никакого отчёта о
+падении гостя:
+
+  libqemu.so: QEMU internal SIGSEGV {code=MAPERR, addr=0}
+
+Гость при этом упал сам и законно: в его журнале — «Fatal signal 11 (SIGSEGV), code 1,
+fault addr 0x0 in tid … (Binder:…)» и «Unable to open connection to debuggerd».
+
+Причина. Обработчик падения bionic 7.x (linker/debugger.cpp,
+debuggerd_signal_handler) после доклада ставит SIG_DFL и посылает себе тот же сигнал
+вызовом rt_tgsigqueueinfo(свой pid, свой tid, сигнал, ИСХОДНЫЙ siginfo) — код у него
+положительный (SEGV_MAPERR = 1). Ядро разрешает положительный код только самому себе
+(с 3.9), и сигнал ждёт в очереди, пока его не откроет маска; при SIG_DFL процесс
+умирает от того же сигнала. QEMU 8.2.4 отдаёт вызов хозяину как есть — и хозяин
+доставляет SIGSEGV с кодом 1 САМОМУ ТРАНСЛЯТОРУ. host_signal_handler по коду > 0
+считает его своим отказом памяти («non-spoofed»), не находит места в переведённом
+коде и умирает с «QEMU internal SIGSEGV». SIGILL, SIGFPE и SIGTRAP с кодом > 0 он
+сразу объявляет ошибкой хозяина, SIGBUS разбирает как SIGSEGV. Хозяйскую маску на
+SIGSEGV и SIGBUS транслятор не ставит никогда — сигнал приходил мгновенно, даже если
+гость его закрыл. Обработчик гостя, поставленный на такой сигнал, не вызывался вовсе;
+при SIG_DFL пропадал отчёт о падении гостя (регистры и место, патч 0035).
+
+Починка. Вызов к себе — rt_tgsigqueueinfo своему потоку, rt_sigqueueinfo своему tid
+(ровно те, кому ядро позволяет код > 0) — с одним из пяти «синхронных» у хозяина
+сигналов и кодом > 0 хозяину не отдаётся: транслятор ставит сигнал в очередь гостя сам,
+туда же и так же, как ставит её асинхронный сигнал хозяина (sigtab, signal_pending; поля
+siginfo — как разобрал бы тот путь: вид QEMU_SI_RT). Дальше — как у ядра в главном:
+process_pending_signals уважает маску гостя, обработчик получает тот же код и адрес,
+при SIG_DFL — отчёт о падении ГОСТЯ и смерть от того же сигнала (код 139). Обычный
+сигнал не копится — второй такой же, пока первый ждёт, пропадает (legacy_queue ядра).
+
+⚠️ Расхождения с ядром, пока сигнал ждёт в очереди транслятора (sigtab; хозяин о нём не
+знает; Р-151 уточнил по проверке Р-149):
+  * rt_sigpending и rt_sigtimedwait гостя QEMU отдаёт хозяину — такого ждущего сигнала они
+    не видят (ядро видит);
+  * sigaction(SIG_IGN) на этот сигнал не снимает уже ждущий (ядро снимает): при SIG_IGN он
+    отбрасывается лишь на доставке, а обработчик, поставленный ДО открытия маски, его получит.
+Случаи крайние: обработчику падения bionic они не нужны (он ставит SIG_DFL и шлёт сигнал
+себе), прошивки по такому пути не ходят.
+
+⚠️ Прочее — как было: вызовы чужим процессам и потокам, прочие сигналы, код ≤ 0 идут к
+хозяину (там путь не путается: код ≤ 0 host_signal_handler понимает как присланный, а
+положительный код чужим ядро отвергает EPERM).
+⚠️ Сигнал процессу (rt_sigqueueinfo) ядро отдало бы любому потоку, который его не закрыл;
+здесь он у зовущего потока (ядро тоже берёт его первым, если тот сигнал не закрыл).
+
+Проверка — tests/qemu/sigqueue.sh (+ sigqprobe.c, без libc): сигнал себе для каждого из
+пяти, через rt_sigqueueinfo, под маской (приходит только после открытия), как bionic
+(настоящий отказ → SIG_DFL → тот же сигнал себе → смерть от SIGSEGV с отчётом «uncaught
+target signal 11»), два контроля (SIGUSR1 с SI_QUEUE; код 1 чужому — EPERM). На телефоне
+те же случаи идут и без транслятора — ожидания сверены с настоящим ядром. На сборке без
+патча под транслятором краснеют все, кроме двух контролей («QEMU internal SIG…»).
+
+--- a/linux-user/signal-common.h
++++ b/linux-user/signal-common.h
+@@ -92,6 +92,25 @@
+  */
+ int block_signals(void); /* Returns non zero if signal pending */
+ 
++/*
++ * ★ Р-149 (патч 0099): сигнал, который гость ставит в очередь САМ СЕБЕ
++ * (rt_tgsigqueueinfo своему потоку, rt_sigqueueinfo своему tid).
++ *
++ * guest_sigqueue_inside: true — такой вызов нельзя отдавать хозяину: сигнал
++ * из числа «синхронных» у хозяина (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP) с
++ * кодом > 0 хозяин доставил бы самому транслятору, и host_signal_handler
++ * принял бы его за СВОЙ отказ. host_sig — номер сигнала хозяина, si_code — код
++ * из siginfo гостя.
++ *
++ * guest_sigqueue_self: поставить сигнал гостю в очередь самим транслятором —
++ * как ставит её путь асинхронного сигнала хозяина (sigtab), с siginfo гостя
++ * (uinfo — копия из памяти гостя, порядок байт гостя). Отдаёт 0 или
++ * -QEMU_ERESTARTSYS (как block_signals).
++ */
++bool guest_sigqueue_inside(int host_sig, int si_code);
++abi_long guest_sigqueue_self(CPUArchState *env, int target_sig,
++                             const target_siginfo_t *uinfo);
++
+ /**
+  * process_sigsuspend_mask: read and apply syscall-local signal mask
+  *
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -1338,6 +1338,97 @@
+     cpu_exit(thread_cpu);
+ }
+ 
++/*
++ * ★★★★★ Р-149: сигнал, который гость ставит в очередь САМ СЕБЕ с кодом > 0.
++ *
++ * Обработчик падения bionic 7.x (linker/debugger.cpp, debuggerd_signal_handler)
++ * после доклада ставит SIG_DFL и посылает себе тот же сигнал вызовом
++ * rt_tgsigqueueinfo с ИСХОДНЫМ siginfo — код у него положительный
++ * (SEGV_MAPERR = 1). Ядро разрешает положительный код только самому себе (с
++ * 3.9: rt_tgsigqueueinfo — своему потоку, rt_sigqueueinfo — своему tid), и
++ * сигнал ждёт в очереди, пока его не откроет маска.
++ *
++ * Транслятор отдавал такой вызов хозяину. Хозяин доставлял SIGSEGV с кодом 1
++ * самому транслятору, а host_signal_handler по коду > 0 считает сигнал СВОИМ
++ * отказом памяти: места в переведённом коде не находит и умирает —
++ *
++ *   qemu-arm: QEMU internal SIGSEGV {code=MAPERR, addr=0}
++ *
++ * Гость не получал ни своего обработчика, ни отчёта транслятора о падении
++ * гостя (регистры, место — патч 0035): композитор 7.1.2 (Р-149) умирал без
++ * следа, где именно. SIGILL, SIGFPE и SIGTRAP с кодом > 0 хозяин и вовсе
++ * считает «ошибкой хозяина» сразу, SIGBUS — так же, как SIGSEGV.
++ *
++ * Здесь вызов к себе с таким сигналом хозяину НЕ отдаётся: транслятор ставит
++ * сигнал в очередь гостя сам — туда же и так же, как ставит её асинхронный
++ * сигнал хозяина (host_signal_handler: sigtab, signal_pending), с siginfo
++ * гостя (поля — как их разобрал бы тот путь: код > 0 → вид QEMU_SI_RT). Дальше
++ * — как у ядра в главном: process_pending_signals уважает маску гостя, обработчик
++ * гостя получает тот же код и адрес, а при SIG_DFL — отчёт о падении ГОСТЯ
++ * (dump_core_and_abort) и смерть от того же сигнала.
++ *
++ * ⚠️ Обычный (не RT) сигнал у ядра не копится: второй такой же, пока первый
++ * ждёт, пропадает (legacy_queue) — так и здесь.
++ * ⚠️ Расхождения, пока сигнал ждёт в sigtab: rt_sigpending и rt_sigtimedwait
++ * гостя QEMU отдаёт хозяину — ждущего сигнала они не видят (ядро видит); а
++ * sigaction(SIG_IGN) ждущий не снимает (ядро снимает) — он отбрасывается лишь
++ * на доставке. Случаи крайние: обработчику падения bionic они не нужны.
++ * ⚠️ Сигнал процессу (rt_sigqueueinfo) ядро отдало бы любому потоку, который
++ * его не закрыл; здесь он всегда у зовущего потока (ядро тоже берёт его первым,
++ * если тот сигнал не закрыл).
++ * ⚠️ Прочие вызовы — чужим процессам и потокам, сигналы не из пяти, код ≤ 0 —
++ * идут к хозяину как прежде: там хозяйский путь не путается (код ≤ 0
++ * host_signal_handler понимает как присланный, а положительный код чужим ядро
++ * отвергает EPERM).
++ */
++bool guest_sigqueue_inside(int host_sig, int si_code)
++{
++    if (si_code <= 0) {
++        return false;
++    }
++    switch (host_sig) {
++    case SIGSEGV:
++    case SIGBUS:
++    case SIGILL:
++    case SIGFPE:
++    case SIGTRAP:
++        return true;
++    }
++    return false;
++}
++
++abi_long guest_sigqueue_self(CPUArchState *env, int target_sig,
++                             const target_siginfo_t *uinfo)
++{
++    TaskState *ts = env_cpu(env)->opaque;
++    struct emulated_sigtable *k;
++    abi_ulong sival;
++    int code;
++
++    if (target_sig < 1 || target_sig > TARGET_NSIG) {
++        return -TARGET_EINVAL;
++    }
++    /* Сигналы хозяина закрыты до process_pending_signals: sigtab не делим с host_signal_handler. */
++    if (block_signals()) {
++        return -QEMU_ERESTARTSYS;
++    }
++    k = &ts->sigtab[target_sig - 1];
++    if (k->pending) {
++        return 0;
++    }
++    __get_user(code, &uinfo->si_code);
++    memset(&k->info, 0, sizeof(k->info));
++    k->info.si_signo = target_sig;
++    __get_user(k->info.si_errno, &uinfo->si_errno);
++    __get_user(k->info._sifields._rt._pid, &uinfo->_sifields._rt._pid);
++    __get_user(k->info._sifields._rt._uid, &uinfo->_sifields._rt._uid);
++    __get_user(sival, &uinfo->_sifields._rt._sigval.sival_ptr);
++    k->info._sifields._rt._sigval.sival_ptr = sival;
++    k->info.si_code = deposit32(code, 16, 16, QEMU_SI_RT);
++    k->pending = target_sig;
++    return 0;
++}
++
+ /* do_sigaltstack() returns target values and errnos. */
+ /* compare linux/kernel/signal.c:do_sigaltstack() */
+ abi_long do_sigaltstack(abi_ulong uss_addr, abi_ulong uoss_addr,
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -12043,6 +12043,7 @@
+     case TARGET_NR_rt_sigqueueinfo:
+         {
+             siginfo_t uinfo;
++            target_siginfo_t tsi;
+             GuestKill gk;
+ 
+             p = lock_user(VERIFY_READ, arg3, sizeof(target_siginfo_t), 1);
+@@ -12050,15 +12051,22 @@
+                 return -TARGET_EFAULT;
+             }
+             target_to_host_siginfo(&uinfo, p);
++            memcpy(&tsi, p, sizeof(tsi));
+             unlock_user(p, arg3, 0);
+             guest_kill_begin(&gk, GUEST_KILL_SIGQ, arg1, 0, arg2);     /* патч 0090 */
+-            ret = get_errno(sys_rt_sigqueueinfo(arg1, target_to_host_signal(arg2), &uinfo));
++            /* ★ патч 0099 (Р-149): «синхронный» сигнал с кодом > 0 своему tid — в очередь гостя самим транслятором. */
++            if (arg1 == sys_gettid() && guest_sigqueue_inside(target_to_host_signal(arg2), uinfo.si_code)) {
++                ret = guest_sigqueue_self(cpu_env, arg2, &tsi);
++            } else {
++                ret = get_errno(sys_rt_sigqueueinfo(arg1, target_to_host_signal(arg2), &uinfo));
++            }
+             guest_kill_end(&gk, ret);
+         }
+         return ret;
+     case TARGET_NR_rt_tgsigqueueinfo:
+         {
+             siginfo_t uinfo;
++            target_siginfo_t tsi;
+             GuestKill gk;
+ 
+             p = lock_user(VERIFY_READ, arg4, sizeof(target_siginfo_t), 1);
+@@ -12066,9 +12074,16 @@
+                 return -TARGET_EFAULT;
+             }
+             target_to_host_siginfo(&uinfo, p);
++            memcpy(&tsi, p, sizeof(tsi));
+             unlock_user(p, arg4, 0);
+             guest_kill_begin(&gk, GUEST_KILL_TGSIGQ, arg1, arg2, arg3); /* патч 0090 */
+-            ret = get_errno(sys_rt_tgsigqueueinfo(arg1, arg2, target_to_host_signal(arg3), &uinfo));
++            /* ★ патч 0099 (Р-149): «синхронный» сигнал с кодом > 0 своему потоку — в очередь гостя самим транслятором. */
++            if (arg1 == getpid() && arg2 == sys_gettid() &&
++                guest_sigqueue_inside(target_to_host_signal(arg3), uinfo.si_code)) {
++                ret = guest_sigqueue_self(cpu_env, arg3, &tsi);
++            } else {
++                ret = get_errno(sys_rt_tgsigqueueinfo(arg1, arg2, target_to_host_signal(arg3), &uinfo));
++            }
+             guest_kill_end(&gk, ret);
+         }
+         return ret;

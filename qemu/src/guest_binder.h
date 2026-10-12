@@ -9,7 +9,7 @@
 // Everything changed in QEMU is listed in NOTICE.
 //
 // Copyright (c) 2026 istratiitech <https://github.com/istratiitech>
-// Changed: 2026-08-29
+// Changed: 2026-08-29 … 2026-10-09
 
 /* guest_binder.h — точки входа шима /dev/binder для linux-user. */
 #ifndef GUEST_BINDER_H
@@ -17,8 +17,10 @@
 
 /* ★ syscall.c знает только этот заголовок: трасса (0062) — через него же. */
 #include "guest_trace.h"
+/* ★ Р-130: и ashmem — do_mmap зовёт guest_ashmem_mmap_prep (патч 0097), отдельный include в syscall.c не нужен. */
+#include "guest_ashmem.h"
 
-int guest_binder_try_open(const char *path, int *fd);
+int guest_binder_try_open(const char *path, int flags, int *fd);
 int guest_binder_owns(int fd);
 int guest_binder_ioctl(int fd, unsigned long req, abi_ulong arg, abi_long *ret);
 int guest_binder_mmap(int fd, abi_ulong len, abi_ulong *addr);

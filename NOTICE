@@ -21,8 +21,8 @@ changes.
 | obtained from | `https://download.qemu.org/qemu-8.2.4.tar.xz` (132694904 bytes) |
 | sha256 of that archive | `ecf5537feab92641b99d7482f551f2195d3a5bd34acef9d52bfbff353a607397` (the build script refuses any other file) |
 | licence | GNU General Public License, version 2 (see `COPYING`); QEMU's own statement on the licences of its files is in `licenses/QEMU-LICENSE.txt` |
-| our patches | **94** (`qemu/patches/*.patch`) |
-| files we added | **39** (`qemu/src/`, 14375 lines) |
+| our patches | **97** (`qemu/patches/*.patch`) |
+| files we added | **39** (`qemu/src/`, 15470 lines) |
 
 ### 1.1. How to get the source code
 
@@ -33,8 +33,9 @@ The complete corresponding source is in this same repository:
 * `qemu/build-android.sh` — the build script (it also downloads the upstream
   QEMU tarball and applies the patches). The build is pinned: the script checks
   the sha256 of the QEMU archive and of the Alpine root it builds in, and writes
-  `qemu/build/BUILD-MANIFEST.txt` (package versions, compiler, patches, checksum
-  of the result). See `README.md`.
+  `qemu/build/BUILD-MANIFEST.txt` (package versions, compiler, the sha256 of every
+  patch, of every file of ours and of the build script itself, checksum of the
+  result). See `README.md`.
 
 To rebuild `libqemu.so` from source, on an **aarch64 Linux** host with root:
 
@@ -75,6 +76,7 @@ into each of them at build time — see the step “ставлю пометки 
 | `linux-user/main.c` |
 | `linux-user/meson.build` |
 | `linux-user/mmap.c` |
+| `linux-user/signal-common.h` |
 | `linux-user/signal.c` |
 | `linux-user/syscall.c` |
 | `linux-user/user-internals.h` |
@@ -83,27 +85,27 @@ into each of them at build time — see the step “ставлю пометки 
 
 **Files we added to `linux-user/`.** Each carries the header
 `SPDX-License-Identifier: GPL-2.0-or-later`. Dates of change:
-2026-08-29 … 2026-10-05.
+2026-08-29 … 2026-10-11.
 
 | file | lines |
 |---|---|
-| `binder_proto.h` | 353 |
+| `binder_proto.h` | 381 |
 | `guest_alarm.c` | 274 |
 | `guest_alarm.h` | 23 |
 | `guest_alarm_core.h` | 588 |
-| `guest_ashmem.c` | 396 |
-| `guest_ashmem.h` | 22 |
-| `guest_binder.c` | 2667 |
-| `guest_binder.h` | 27 |
-| `guest_fb.c` | 384 |
+| `guest_ashmem.c` | 794 |
+| `guest_ashmem.h` | 34 |
+| `guest_binder.c` | 3010 |
+| `guest_binder.h` | 29 |
+| `guest_fb.c` | 503 |
 | `guest_fb.h` | 21 |
-| `guest_fs.c` | 448 |
-| `guest_fs.h` | 22 |
+| `guest_fs.c` | 626 |
+| `guest_fs.h` | 23 |
 | `guest_fwinit.c` | 772 |
 | `guest_fwinit.h` | 92 |
 | `guest_ids.c` | 775 |
 | `guest_ids.h` | 93 |
-| `guest_input.c` | 479 |
+| `guest_input.c` | 486 |
 | `guest_input.h` | 22 |
 | `guest_input_pump.h` | 559 |
 | `guest_kill.c` | 236 |
@@ -112,7 +114,7 @@ into each of them at build time — see the step “ставлю пометки 
 | `guest_net.h` | 82 |
 | `guest_oom.c` | 159 |
 | `guest_oom.h` | 28 |
-| `guest_pagelog.c` | 779 |
+| `guest_pagelog.c` | 786 |
 | `guest_pagelog.h` | 62 |
 | `guest_proc.c` | 385 |
 | `guest_proc.h` | 45 |
@@ -143,9 +145,24 @@ stand: the names of its UNIX sockets as guest paths and the stand's own descript
 through `task/<thread>/` and `thread-self` (patch 0095, `guest_procpath.h`), a journal of
 the signals one guest process sends to another — who, to whom, which signal (`guest_kill.c`), the
 alarm device `/dev/alarm` of Android kept on the phone's timers (patch 0096, `guest_alarm.c`,
-`guest_alarm_core.h`), the return from a signal handler into Thumb code (`linux-user/arm/signal.c`), the sessions of the emulated
+`guest_alarm_core.h`), the two screen-wait nodes `/sys/power/wait_for_fb_sleep` and `…_wake` answered as the
+kernel does with the screen on (the first sleeps for ever, the second says "awake"), when the
+tree has no such node (patch 0006 passes the open flags, `guest_fs.c`), the `READ_IMPLIES_EXEC` personality
+the ARM kernel gives a program without a `PT_GNU_STACK` header, so that readable memory (heap, anonymous and
+file mappings) is executable for such old programs (patch 0098, `linux-user/mmap.c`, `linux-user/elfload.c`),
+the return from a signal handler into Thumb code (`linux-user/arm/signal.c`), a fault-class signal (SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP) that the guest queues to itself with a positive code — as the crash handler of the Android C library re-raises a crash — put on the guest's own queue instead of being taken by the translator for its own fault (patch 0099, `linux-user/signal.c`, `linux-user/syscall.c`, `linux-user/signal-common.h`), the sessions of the emulated
 touchscreen and their relay threads, which end as soon as the guest closes the device by any path and
-greet the stand with a session token (`guest_input_pump.h`), plus working around the
+greet the stand with a session token (`guest_input_pump.h`), a one-finger touchscreen for old
+systems that take a device with multi-touch axes only for a keyboard (the stand asks for it by a
+variable, `guest_input.c`), two pages of the framebuffer with page flipping, again only on the
+stand's request, for old compositors that draw straight into it (`guest_fb.c`), the kernel's
+traffic accounting that the guest expects, its control file and quota files kept in memory
+(patch 0069, `guest_fs.c`), the number of descriptors in one binder message raised to the
+kernel's own limit and the commands the driver does not support refused with `EINVAL` as the
+kernel does (`guest_binder.c`, `binder_proto.h`), a read-only mapping of an `ashmem` region
+made through a descriptor reopened read-only (or, where the host's SELinux forbids that, as a
+private mapping), as a sealed region needs on host kernels older than 5.1 (patch 0097,
+`guest_ashmem.c`), plus working around the
 ways Android behaves as a *host* (paths, permissions, identifiers, SELinux
 restrictions). Every patch begins with a description of the symptom it exists
 for. The numbers and both tables of this section are checked against the tree
@@ -216,6 +233,38 @@ application package. They are used **unmodified**.
 * source code: `https://github.com/JetBrains/kotlin` (version 2.0.21) and
   `https://github.com/JetBrains/java-annotations` (version 13.0).
 
+### 2.3. libarchive, xz (liblzma) and bzip2 (libbz2) — statically linked into `libunarc.so`
+
+`libunarc.so` (the program `unarc`) is a small helper of ours, written from
+scratch in C. Firmware often comes wrapped in an archive of its own — RAR, 7z,
+CAB, or a gzip, xz or bzip2 stream — and the helper opens that wrapper before the
+firmware inside is read. It is a **separate process** (started by the
+application with `ProcessBuilder`, like QEMU); no code of these libraries runs
+inside the application. It links the three libraries below **statically** and, of
+the system, only `libc.so`, `libdl.so` and `libz.so` (the phone's own zlib; it is
+not shipped by us). All three are used **unmodified**, from the source archives
+named here (the build script checks the sha256 of each and refuses any other
+file); the exact versions, sums, compiler and the sha256 of the result of every
+build are recorded in the maintainer's own build manifest of the helper (it is not
+part of this source distribution: the three licences ask for no such file).
+
+| component | version | licence | source | sha256 of that archive |
+|---|---|---|---|---|
+| libarchive | 3.8.1 | BSD-2-Clause; a few files carry their own terms (listed in the licence text; the BLAKE2 files are taken under Apache-2.0) | `https://github.com/libarchive/libarchive/releases/download/v3.8.1/libarchive-3.8.1.tar.xz` | `19f917d42d530f98815ac824d90c7eaf648e9d9a50e4f309c812457ffa5496b5` |
+| xz (only liblzma) | 5.8.1 | BSD Zero Clause License (0BSD) | `https://github.com/tukaani-project/xz/releases/download/v5.8.1/xz-5.8.1.tar.xz` | `0b54f79df85912504de0b14aec7971e3f964491af1812d83447005807513cd9e` |
+| bzip2 (only libbz2) | 1.0.8 | the bzip2 licence (BSD-style) | `https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz` | `ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269` |
+
+Built in: reading RAR4 and RAR5, 7z, CAB, zip, tar, ISO 9660, LHA, cpio, ar, mtree
+and WARC, the gzip, xz, bzip2, compress, uu and RPM streams, and writing the
+extracted files to disk. Not built in: zstd, lz4, OpenSSL and other cryptography,
+iconv, XML libraries — so a password-protected archive is refused, not opened.
+
+* licence texts: `licenses/libarchive-COPYING.txt` (the upstream `COPYING` verbatim,
+  followed by the notices of the individual files that carry their own terms and
+  by the copyright holders of the libarchive files built into the helper),
+  `licenses/liblzma-0BSD.txt`, `licenses/bzip2-LICENSE.txt`; the Apache License 2.0
+  (for the BLAKE2 files) is `licenses/Apache-2.0.txt`.
+
 ---
 
 ## 3. Android Open Source Project headers — Apache License 2.0
@@ -242,24 +291,33 @@ are **a separate program**. The libraries in the package are:
 * on the phone (arm64, `lib/arm64-v8a/`, built with the Android NDK):
   `libglbridge.so` (the GL bridge, loaded into the application),
   `libglserverd.so` (the GL server), `libbinderd.so` (`binderd`, the binder
-  daemon), `libguestrun.so` (`guestrun`, the launcher of guest programs) and
-  `libbtstub.so` (`btstub`, a stand-in for one binder service of the guest). They
-  link dynamically only against the system libraries of the phone (libc, libm,
-  libdl, liblog, libandroid, libEGL, libGLESv1/v2/v3). `libqemu.so` in the same
-  directory is the modified QEMU of section 1 and is not covered by this
-  paragraph;
+  daemon), `libguestrun.so` (`guestrun`, the launcher of guest programs),
+  `libbtstub.so` (`btstub`, a stand-in for one binder service of the guest) and
+  `libunarc.so` (`unarc`, the helper that opens archive wrappers; section 2.3).
+  They link dynamically only against the system libraries of the phone (libc,
+  libm, libdl, libz, liblog, libandroid, libEGL, libGLESv1/v2/v3).
+  `libunarc.so` carries libarchive, liblzma and libbz2 inside it, statically
+  (section 2.3). `libqemu.so` in the same directory is the modified QEMU of
+  section 1 and is not covered by this paragraph;
 * in the guest (ARM32, inside `assets/tools.payload`, copied by the application
   into the guest tree on the device): `libGLES.so`, `libGLESfollow.so`,
   `libashmemshim.so`, `noop`, `audio.primary.default.so`, `gralloc.default.so`,
   `hwcomposer.default.so` and `consumerir.default.so` (built without a C library
-  of their own: they need nothing, or only the guest's own `libc.so`), the
-  class file archive `hello.jar` and the generated property area `guest.props`.
+  of their own: they need nothing but the guest's own system libraries
+  (`libc.so`, `libdl.so`, `libEGL.so`)), the class file archive `hello.jar` and
+  the generated property area `guest.props`.
 
 QEMU is started from the application as a **separate process**
 (`ProcessBuilder`); they communicate over sockets, command-line arguments and
 files. No QEMU code is loaded into the application's process, and none of QEMU's
 source is used in these libraries — they are written from scratch on raw system
 calls and the system libraries listed above.
+
+The programs of the phone side (`libbinderd.so`, `libbtstub.so`, `libglserverd.so`,
+`libguestrun.so`, `libunarc.so`) and `libglbridge.so` contain the start-up code of the
+C library of the Android NDK (the `crtbegin_*.o` and `crtend_*.o` files of its sysroot;
+BSD licence, The Android Open Source Project). Its text is `licenses/AndroidNDK-BSD.txt`;
+the notices of the individual files are in the NOTICE file of the NDK sysroot.
 
 `binderd` and the translator talk over a socket using the protocol declared in
 `qemu/src/binder_proto.h` (published under GPL-2.0-or-later); `binderd` contains
@@ -284,6 +342,43 @@ copy (patched code, re-signed packages, removed vendor modules); nothing is sent
 anywhere. Package signatures of the copy are replaced with a key generated on
 your device.
 
+When the firmware's own installer has a menu, the application answers its screens
+with the default choices, as a person pressing "Next" would, and does not show
+them, with one exception: the agreement screen. The application shows you that
+agreement in full before unpacking, with the buttons "I accept" and "I do not
+accept"; the agreement is accepted by you and never by the application, and if you
+do not accept it nothing is unpacked and nothing is created (no container, no
+entry in the list of containers). The application keeps a record of your
+acceptance on the device, in the container (the firmware tag, the number of
+screens, a short digest of their text and the date); when you unpack the same
+firmware again in place, it shows the agreement again unless that record says you
+accepted it. Where such an agreement screen is found, the
+application also says so before the first start (in the window that shows the
+archive, and in the journal of the application). The application does not skip the
+firmware's own first-run wizard: it appears when the firmware starts, with any
+terms it presents, and you go through it yourself. The wizard can be turned off
+only by hand, with the "First-run wizard" switch of a container in the firmware
+settings window; that switch asks you, every time and for every container, to
+confirm that you have studied the agreements of the firmware yourself and accept
+them, and the application never sets it by itself, not even in automatic
+selection. By starting a firmware in the application you confirm that you have
+read and accept the terms of that firmware and of the software inside it. These
+changes are made for compatibility only: they do not remove copy protection,
+DRM, licence checks of applications or account protection.
+
+Other changes made to the copy for compatibility: the installer's own steps for
+`/data` are replayed at the first start, including its helper programs, run
+inside the guest; a firmware built for several devices gets the files of one
+variant; a binder service of vendor display hardware that the stand does not
+have is answered by a stub that says "not supported" to every call; the guest
+gets the phone's time zone; the `${…}` references in the arguments of the
+commands of the firmware's own `init*.rc` are expanded the way its own `init`
+does it, from the properties that lie in the firmware; several settings of the
+copy are switched (package verification off, installing from files allowed,
+mobile data on; and the "set-up done" flags only if you have turned the first-run
+wizard off by hand as described above), all of them ordinary switches you can
+change back inside the guest.
+
 The application also runs a local TLS proxy: a root certificate generated on
 your device is added to the trust store of the copy, so that the firmware (which
 speaks only TLS 1.0) can reach the modern internet. The key never leaves the
@@ -305,7 +400,7 @@ supplied by the project owner, and the package ships no photograph:
   is involved;
 * the lettering between the on-screen keys ("SENSES"), the lettering in the
   "about" window that opens when the phone is shaken while no system is
-  running ("ISTRATII_TECH"), and the launcher icon are vector drawings
+  running (the author's name), and the launcher icon are vector drawings
   supplied by the project owner: `art/logo_menu.svg`, `art/logo_about.svg`
   and `art/icon.svg`. `tools/mkicon.py` reads the numbers from the drawings
   and renders the letters, on the maintainer's computer, into coverage masks
@@ -342,6 +437,10 @@ repository. The texts of the other licences are in `licenses/`:
 | `licenses/LGPL-2.1.txt` | GLib and GNU gettext (section 1.3); the LGPL parts of QEMU |
 | `licenses/musl-COPYRIGHT.txt` | musl libc (section 1.3) |
 | `licenses/zlib.txt` | zlib (section 1.3) |
+| `licenses/libarchive-COPYING.txt` | libarchive, the notices of its individual files and the copyright holders of the files built in (section 2.3) |
+| `licenses/liblzma-0BSD.txt` | liblzma of xz (section 2.3) |
+| `licenses/bzip2-LICENSE.txt` | libbz2 of bzip2 (section 2.3) |
+| `licenses/AndroidNDK-BSD.txt` | start-up code of the C library of the Android NDK in the programs of the phone side (section 4) |
 | `licenses/QEMU-LICENSE.txt` | QEMU's statement on the licences of its files (section 1) |
 
 ---

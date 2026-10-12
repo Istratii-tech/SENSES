@@ -1,0 +1,293 @@
+libarchive licence (COPYING of libarchive 3.8.1, verbatim; below it, the notices of the individual files that carry their own terms)
+
+The libarchive distribution as a whole is Copyright by Tim Kientzle
+and is subject to the copyright notice reproduced at the bottom of
+this file.
+
+Each individual file in this distribution should have a clear
+copyright/licensing statement at the beginning of the file.  If any do
+not, please let me know and I will rectify it.  The following is
+intended to summarize the copyright status of the individual files;
+the actual statements in the files are controlling.
+
+* Except as listed below, all C sources (including .c and .h files)
+  and documentation files are subject to the copyright notice reproduced
+  at the bottom of this file.
+
+* The following source files are also subject in whole or in part to
+  a 3-clause UC Regents copyright; please read the individual source
+  files for details:
+   libarchive/archive_read_support_filter_compress.c
+   libarchive/archive_write_add_filter_compress.c
+   libarchive/mtree.5
+
+* The following source files are in the public domain:
+   libarchive/archive_parse_date.c
+
+* The following source files are triple-licensed with the ability to choose
+  from CC0 1.0 Universal, OpenSSL or Apache 2.0 licenses:
+   libarchive/archive_blake2.h
+   libarchive/archive_blake2_impl.h
+   libarchive/archive_blake2s_ref.c
+   libarchive/archive_blake2sp_ref.c
+
+* The build files---including Makefiles, configure scripts,
+  and auxiliary scripts used as part of the compile process---have
+  widely varying licensing terms.  Please check individual files before
+  distributing them to see if those restrictions apply to you.
+
+I intend for all new source code to use the license below and hope over
+time to replace code with other licenses with new implementations that
+do use the license below.  The varying licensing of the build scripts
+seems to be an unavoidable mess.
+
+
+Copyright (c) 2003-2018 <author(s)>
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer
+   in this position and unchanged.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE AUTHOR(S) ``AS IS'' AND ANY EXPRESS OR
+IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+IN NO EVENT SHALL THE AUTHOR(S) BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+----------------------------------------------------------------------------
+Files of libarchive with terms of their own (some of them are built into `unarc`)
+
+Notices of individual files, verbatim from the headers of libarchive 3.8.1
+(the COPYING above lists some of them; its statement "the actual statements in
+the files are controlling" applies).  Each item says whether the file is built
+into `unarc`:
+
+1. libarchive/archive_read_support_filter_compress.c (the `compress` / `.Z`
+   filter; built into `unarc`) — the Regents notice, clause 3 dropped by their
+   request:
+
+/*-
+ * Copyright (c) 1985, 1986, 1992, 1993
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * This code is derived from software contributed to Berkeley by
+ * Diomidis Spinellis and James A. Woods, derived from original
+ * work by Spencer Thomas and Joseph Orost.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+2. libarchive/archive_rb.c (red-black tree; built into `unarc`):
+
+/*-
+ * Copyright (c) 2001 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Matt Thomas <matt@3am-software.com>.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Based on: NetBSD: rb.c,v 1.6 2010/04/30 13:58:09 joerg Exp
+ */
+
+3. libarchive/archive_pack_dev.c (device numbers; originally from the NetBSD
+   mknod(8) source; built into `unarc`):
+
+/*-
+ * Copyright (c) 1998, 2001 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Charles M. Hannum.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+4. libarchive/archive_random.c (derived from the OpenBSD arc4random.c; NOT built
+   into `unarc`, kept here for completeness):
+
+/*
+ * Copyright (c) 1996, David Mazieres <dm@uun.org>
+ * Copyright (c) 2008, Damien Miller <djm@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+5. libarchive/archive_blake2.h, archive_blake2_impl.h, archive_blake2s_ref.c,
+   archive_blake2sp_ref.c (Copyright 2012, Samuel Neves; built into `unarc`):
+   triple-licensed CC0 1.0 / OpenSSL / Apache-2.0 at the user's option.  We take
+   the Apache License 2.0 (the text is in licenses/Apache-2.0.txt).
+
+6. Public domain.  The PPMd code (archive_ppmd7.c, archive_ppmd8.c and their
+   headers: Igor Pavlov, Dmitry Shkarin, and for the range coder of PPMd var.I
+   Dmitry Subbotin) and the BCJ and BCJ2 filters of the x86 code inside
+   archive_read_support_format_7zip.c ("Brought from LZMA SDK", Igor Pavlov)
+   are built into `unarc`; libarchive/archive_parse_date.c is not.
+
+7. libarchive/archive_entry.c (built into `unarc`) — the part of the file that is
+   "modified from UC Berkeley sources" (the text form of the file flags) carries
+   this notice, clause 3 dropped as in item 1:
+
+/*-
+ * Copyright (c) 1993
+ *	The Regents of the University of California.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+8. libarchive/archive_read_support_format_7zip.c (built into `unarc`) holds, besides
+   the 7z reader itself, the branch/call/jump (BCJ) filters of the 7z format:
+   the ARM and ARM64 filters are adapted from XZ Embedded (authors Lasse Collin
+   and Igor Pavlov, "put into the public domain"); the SPARC filter (XZ Embedded)
+   and the PowerPC filter (XZ Utils) carry the notices below, which are the BSD
+   Zero Clause licence (see licenses/liblzma-0BSD.txt for its text):
+
+    Copyright (C) The XZ Embedded authors and contributors    [SPARC filter]
+    Copyright (C) The XZ Utils authors and contributors       [PowerPC filter]
+
+    Permission to use, copy, modify, and/or distribute this
+    software for any purpose with or without fee is hereby granted.
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+    WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+    WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL
+    THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+    CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+    LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+    NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+    CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+
+----------------------------------------------------------------------------
+Copyright holders of the libarchive files built into `unarc`
+
+9. The files of libarchive built into `unarc` (the reader of RAR, RAR5, 7z, CAB,
+   zip, tar, ISO 9660, LHA, cpio, ar, mtree and WARC, the gzip, xz, bzip2,
+   compress, uu and RPM filters, and the writer of the extracted files to disk;
+   see NOTICE, section 2.3) are under the BSD-2-Clause licence reproduced at the
+   top of this file, with the holders below in place of "<author(s)>" (all
+   rights reserved).  The list is taken from the headers of those files and of
+   the headers they include; the files with terms of their own (items 1 to 8)
+   are under the notices given there.
+
+   Copyright (c) 2003-2023 Tim Kientzle
+   Copyright (c) 2003-2008 Tim Kientzle and Miklos Vajna
+   Copyright (c) 2008-2014 Michihiro NAKAJIMA
+   Copyright (c) 2016, 2017, 2020 Martin Matuska
+   Copyright (c) 2011 Andres Mejia
+   Copyright (c) 2018 Grzegorz Antoniak
+   Copyright (c) 2007 Kai Wang
+   Copyright (c) 2008, 2009 Joerg Sonnenberger
+   Copyright (c) 2009 Andreas Henriksson
+   Copyright (c) 2013 Konrad Kleine
+   Copyright (c) 2008 Anselm Strauss
+   Copyright (c) 2014 Sebastian Freundt
+   Copyright (c) 2011-2012 libarchive Project
+   Copyright (c) 2002 Thomas Moestl
+   Copyright (c) 2025 ARJANEN Loïc Jean David

@@ -9,7 +9,7 @@
 // Everything changed in QEMU is listed in NOTICE.
 //
 // Copyright (c) 2026 istratiitech <https://github.com/istratiitech>
-// Changed: 2026-08-29 … 2026-10-05
+// Changed: 2026-08-29 … 2026-10-11
 
 // guest_binder.c — изображает драйвер /dev/binder для гостевой прошивки.
 //
@@ -204,6 +204,8 @@ static int connect_sock(const char *spec)
 // которые демон завёл при переводе. Для блоков, выделенных не под приём, нули.
 struct blk { size_t off, size; int used; int cool; uint32_t dsize, osize; struct blk *next; };
 
+struct thr;
+
 struct sess {
     int used;
     int fd_guest;              // конец A: его видит гость
@@ -269,6 +271,20 @@ struct sess {
     int closing;
     struct { int fd; pid_t pid; } tfd[SB_MAXTHR];
     int ntfd;
+    /*
+     * ★★★★★ ОДНОСТОРОННИЕ, ВЫДАННЫЕ ГОСТЮ И ЕЩЁ НЕ ОСВОБОЖДЁННЫЕ (Р-128).
+     *
+     * «Узел свободен» (SB_ASYNC_DONE) мы говорим демону, когда гость вернул
+     * буфер этой односторонней командой BC_FREE_BUFFER, — а вернуть его может
+     * и ДРУГАЯ нить процесса (Parcel пережил обработчик). Чтобы такую
+     * находить, учёт живёт у сессии: адрес буфера и нить-держатель, у которой
+     * в руках односторонняя (`t == NULL` — ряд свободен). Не больше одной на
+     * нить, поэтому рядов столько же, сколько учитываемых нитей. Всё — под
+     * замком `lock`; `aw_n` читается без замка лишь как подсказка «пусто,
+     * можно не искать» на горячем пути BC_FREE_BUFFER.
+     */
+    struct { uint64_t addr; struct thr *t; } aw[SB_MAXTHR];
+    int aw_n;
 };
 
 // Отложенное сообщение демона. Отложить приходится по двум причинам: оно не
@@ -359,11 +375,44 @@ struct thr {
     /* ★ Сколько наших посылок демон не принял. Норма — ноль. */
     int lost;
     /*
-     * ★★★★★ В прошлом заходе отдали гостю ОДНОСТОРОННЮЮ транзакцию. В начале
-     * следующего ioctl скажем демону SB_ASYNC_DONE: к этому мигу гость уже
-     * выполнил executeCommand, и демон может отдавать следующую к тому же узлу.
+     * ★★★★★ ОДНОСТОРОННЯЯ У ГОСТЯ В РУКАХ (Р-128).
+     *
+     * Демон держит односторонние к одному узлу по одной (как `async_todo` у
+     * настоящего драйвера) и отпускает узел, когда мы скажем SB_ASYNC_DONE.
+     * Говорим ровно тогда, когда гость вернул буфер этой односторонней командой
+     * BC_FREE_BUFFER — так отпускает узел и сам драйвер (`binder_thread_write`,
+     * BC_FREE_BUFFER: `if (buffer->async_transaction) … async_todo`), а
+     * libbinder возвращает буфер в конце `executeCommand`, когда разрушается
+     * Parcel.
+     *
+     * ⚠️ ИСТОРИЯ. 16 сентября отчёт шёл с SB_UNWAIT на выходе из ioctl — то
+     * есть ДО того, как гость вообще увидел работу, и сериализация не делала
+     * ничего. Потом — «в начале следующего ioctl этой нити»: расчёт, что между
+     * двумя ioctl libbinder выполнил executeCommand целиком. Неверно, когда
+     * обработчик односторонней САМ зовёт binder: следующий ioctl случается
+     * ВНУТРИ обработчика. 09.10 так обгоняли друг друга BIND_APPLICATION и
+     * CREATE_SERVICE: `bindApplication` зовёт PackageManager и кладёт
+     * H.BIND_APPLICATION в очередь главного потока только в самом конце, демон
+     * к этому времени уже отпустил узел, и `scheduleCreateService` с другого
+     * потока успевала раньше — NPE в `handleCreateService` (Р-128).
+     *
+     *   async_buf   — хозяйский адрес буфера такой односторонней (0 — нет);
+     *                 пишется под замком сессии (см. sess.aw);
+     *   async_flush — отчитаться «разобрал» в начале ближайшего ioctl: так
+     *                 уходит случай «буфер освободила ДРУГАЯ нить» (ей писать
+     *                 в наш сокет нельзя), а ещё «таблица полна». Новая
+     *                 односторонняя этой нити признак СБРАСЫВАЕТ: слот демона
+     *                 (он один на соединение) теперь у неё, и отчёт о старой
+     *                 отпустил бы её досрочно (см. async_hold).
      */
-    int async_pending;
+    uint64_t async_buf;
+    int async_flush;
+    /*
+     * ★ Р-128в (проверка Р-128, мелкое 3б): нить сейчас выдаёт гостю «ничейное» из очереди процесса (dq_flush) — сообщение принял СОКЕТ
+     * ушедшей нити, и её узел демон отпустил в conn_close; учёт «разобрал» (async_hold) для него не заводится: иначе гость, вернув
+     * его буфер, отпустил бы тем, что лежит в слоте ЭТОЙ нити (там может быть ещё исполняемая односторонняя).
+     */
+    int orphan_msg;
 };
 
 static struct sess g_sess[SB_MAXSESS];
@@ -499,9 +548,157 @@ static void tr_end(struct thr *t, char kind)
     }
 }
 
+/*
+ * ★★★★★ «ОДНОСТОРОННЮЮ РАЗОБРАЛ» — по BC_FREE_BUFFER её буфера (Р-128).
+ * Почему именно так — см. поле thr.async_buf.
+ */
+
+// Сказать демону «узел свободен» — по сокету САМОЙ нити, чужому не мешаем.
+static void async_done_send(struct thr *t) {
+    if (t->fd < 0) return;
+    struct sb_hdr ah = { .len = sizeof ah, .type = SB_ASYNC_DONE,
+                          .tid = (uint32_t)gettid(), .flags = SB_F_MAGIC };
+    (void)!write(t->fd, &ah, sizeof ah);
+}
+
+/*
+ * ★★★ Р-128в (проверка Р-128, мелкое 3а): односторонняя ПРИНЯТА из своего сокета (drecv) — демон при выдаче уже поставил её узел в
+ * слот ЭТОГО соединения. Отложенный «разобрал» (async_flush) относился к прежней односторонней: отправленный теперь, он отпустил бы
+ * этот новый узел. Раньше признак сбрасывал только async_hold — при выдаче гостю, а принятую могли отложить в t->dq (не влезла в
+ * буфер чтения, подтверждение впереди) и признак успевал отпустить узел досрочно.
+ */
+static void async_on_received(struct thr *t) {
+    if (__atomic_exchange_n(&t->async_flush, 0, __ATOMIC_ACQ_REL))
+        bwarn("binder: ★ сброшен отложенный «разобрал» нити: из сокета принята новая односторонняя — "
+              "слот демона уже у неё, старый узел освободит предохранитель демона");
+}
+
+// Односторонняя только что выдана гостю (msg_to_br, ПОСЛЕ успешной выдачи):
+// запомнить её буфер за этой нитью.
+//
+// ⚠️★★★ У ДЕМОНА ОДИН СЛОТ `async_node` НА СОЕДИНЕНИЕ (binderd.c, proc_kick:
+// выдавая любую одностороннюю, он перезаписывает его новым узлом), а на
+// SB_ASYNC_DONE отпускает ТО, ЧТО В СЛОТЕ СЕЙЧАС. Поэтому «разобрал» за СТАРУЮ
+// односторонную, отправленный после выдачи новой, отпустил бы НОВЫЙ узел —
+// досрочно, и это ровно та беда Р-128, но уже для новой. Отсюда правила:
+//   • новая односторонняя забирает слот демона себе — отложенный признак
+//     async_flush (если стоял: чужая нить уже вернула старый буфер, а держатель
+//     не успел отчитаться) СБРАСЫВАЕМ, с bwarn;
+//   • «вторая» у нити, ещё не вернувшей первую, признака НЕ получает: старый
+//     узел освободит предохранитель демона (5 с, «УЗЕЛ ЗАПЕРТ»), а не наш отчёт
+//     о ней, который отпустил бы чужой узел;
+//   • признак остаётся только в ветке «таблица полна»: учёта нет вовсе, и
+//     прежний расчёт (отчёт в начале ближайшего ioctl) — всё, что есть.
+static void async_hold(struct thr *t, struct sess *s, uint64_t buf) {
+    int clash = 0, full = 0, stale = 0;
+    uint64_t old = 0;
+    pthread_mutex_lock(&s->lock);
+    int i = -1;
+    if (t->async_buf) {
+        for (int k = 0; k < SB_MAXTHR; k++) if (s->aw[k].t == t) { i = k; break; }
+        if (i >= 0) { clash = 1; old = t->async_buf; }
+        // Иначе учёт устарел: сессию закрыли и открыли заново при живой нити
+        // (memset в binder_open_fake чистит `aw`, но не t->async_buf) — заводим
+        // как новую, без ложной «полна».
+    }
+    if (i < 0) {
+        for (int k = 0; k < SB_MAXTHR; k++) if (!s->aw[k].t) { i = k; break; }
+        if (i >= 0) __atomic_add_fetch(&s->aw_n, 1, __ATOMIC_RELEASE);
+    }
+    if (i >= 0) {
+        s->aw[i].t = t;
+        s->aw[i].addr = buf;
+        t->async_buf = buf;
+        // Слот демона теперь у этой односторонней: чужой отложенный отчёт отпустил бы её.
+        stale = __atomic_exchange_n(&t->async_flush, 0, __ATOMIC_ACQ_REL);
+    } else {
+        // Таблица полна (нитей больше учёта) — прежний расчёт и для этой.
+        full = 1;
+        t->async_buf = 0;
+        __atomic_store_n(&t->async_flush, 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&s->lock);
+    if (clash)
+        bwarn("binder: ★ вторая односторонняя в руках у нити (старый буфер 0x%llx, новый "
+              "0x%llx): слот демона теперь у новой, старый узел освободит только "
+              "предохранитель демона (5 с)",
+              (unsigned long long)old, (unsigned long long)buf);
+    if (stale)
+        bwarn("binder: ★ сброшен отложенный «разобрал» нити: слот демона уже у новой "
+              "односторонней (буфер 0x%llx) — старый узел освободит предохранитель демона",
+              (unsigned long long)buf);
+    if (full)
+        bwarn("binder: ★ таблица односторонних полна (%d) — отпускаю в начале ближайшего "
+              "ioctl, как прежде", SB_MAXTHR);
+}
+
+// Гость вернул буфер `addr` (BC_FREE_BUFFER, после buf_free): если это буфер
+// односторонней, ушедшей гостю, — узел свободен.
+static void async_on_free(struct thr *t, struct sess *s, uint64_t addr) {
+    if (!__atomic_load_n(&s->aw_n, __ATOMIC_ACQUIRE)) return;   // односторонних в руках нет
+    struct thr *holder = NULL;
+    int foreign = 0;
+    pthread_mutex_lock(&s->lock);
+    for (int i = 0; i < SB_MAXTHR; i++) {
+        if (!s->aw[i].t || s->aw[i].addr != addr) continue;
+        holder = s->aw[i].t;
+        s->aw[i].t = NULL;
+        s->aw[i].addr = 0;
+        __atomic_sub_fetch(&s->aw_n, 1, __ATOMIC_RELEASE);
+        holder->async_buf = 0;
+        /*
+         * Буфер вернула ДРУГАЯ нить (Parcel пережил обработчик): писать в
+         * сокет держателя ей нельзя — он может быть посреди чтения или записи.
+         * Ставим признак; держатель отчитается сам в начале своего ioctl.
+         * ⚠️ Признак — ЗДЕСЬ, под замком: после unlock держатель мог бы уйти
+         * (thr_free снимает учёт под этим же замком) и освободиться.
+         */
+        if (holder != t) { __atomic_store_n(&holder->async_flush, 1, __ATOMIC_RELEASE); foreign = 1; }
+        break;
+    }
+    pthread_mutex_unlock(&s->lock);
+    // Своя нить: «разобрал» уходит сразу, тем же сокетом, сразу после разбора команды.
+    if (holder == t) async_done_send(t);
+    /*
+     * ★ Чужая нить вернула буфер — единственный путь, на котором узел может
+     * держаться до предохранителя (держатель стоит в чтении, и следующего ioctl
+     * у него может долго не быть). Строку пишем редко, по образцу cpl_orphan:
+     * если на телефоне появится «УЗЕЛ ЗАПЕРТ», причину можно будет отличить.
+     */
+    if (foreign) {
+        static int nforeign;
+        int n = __atomic_add_fetch(&nforeign, 1, __ATOMIC_RELAXED);
+        if (n <= 8 || (n % 100) == 0)
+            bwarn("binder: ★ буфер односторонней 0x%llx — чужая нить вернула: «разобрал» "
+                  "уйдёт в начале ближайшего ioctl держателя (всего таких %d)",
+                  (unsigned long long)addr, n);
+    }
+}
+
+// Нить уходит: снять её учёт, чтобы в таблице не осталась ссылка на освобождённую
+// нить. Если односторонняя так и не была возвращена, узел освободит демон
+// (conn_close → async_release). ⚠️ Смотрим ВСЕ сессии, а не t->s: нить привязана
+// к той, что открыла первой, а односторонняя могла прийти по другой.
+static void async_forget(struct thr *t) {
+    for (int k = 0; k < SB_MAXSESS; k++) {
+        struct sess *s = &g_sess[k];
+        if (!s->used) continue;
+        pthread_mutex_lock(&s->lock);
+        for (int i = 0; i < SB_MAXTHR; i++) {
+            if (s->aw[i].t != t) continue;
+            s->aw[i].t = NULL;
+            s->aw[i].addr = 0;
+            __atomic_sub_fetch(&s->aw_n, 1, __ATOMIC_RELEASE);
+        }
+        pthread_mutex_unlock(&s->lock);
+    }
+    t->async_buf = 0;
+}
+
 static void thr_free(void *p) {
     struct thr *t = (struct thr *)p;
     if (!t) return;
+    async_forget(t);
     /*
      * ★★★★★ ОТЛОЖЕННОЕ НЕ БРОСАЕМ — ПЕРЕКЛАДЫВАЕМ ПРОЦЕССУ.
      *
@@ -797,6 +994,10 @@ static void binder_atfork_child(void) {
         // ребёнку нельзя, а свои его потоки заведут заново.
         s->ntfd = 0;
         s->closing = 0;
+        // ⚠️ Односторонние в руках у нитей РОДИТЕЛЯ (Р-128) ребёнку не принадлежат:
+        // его соединения с демоном заведены заново, узлы держит родитель.
+        memset(s->aw, 0, sizeof s->aw);
+        s->aw_n = 0;
     }
     struct thr *t = (struct thr *)pthread_getspecific(g_thrkey);
     if (t && t->fd >= 0) { close(t->fd); t->fd = -1; dq_drop(t); }
@@ -806,7 +1007,8 @@ static void binder_atfork_child(void) {
     // который придёт РОДИТЕЛЮ. Зигота живёт форками — тут это цена всего.
     if (t) { t->acks = 0; t->completes = 0; t->failed = 0; t->iseq = 0; t->sent = 0;
              t->in_txn = 0; t->in_death = 0; t->tx_at_death = 0;
-             t->pending_sync = 0; t->tx_total = 0; t->cpl_given = 0; }
+             t->pending_sync = 0; t->tx_total = 0; t->cpl_given = 0;
+             t->async_buf = 0; t->async_flush = 0; }
     g_first_thread_done = 0;
     for (int i = 0; i < SB_MAXSESS; i++)
         if (g_sess[i].used) pump_start(&g_sess[i]);
@@ -958,11 +1160,12 @@ static int dsend(struct thr *t, uint16_t type, const void *body, uint32_t blen,
                          .nfds = (uint16_t)nfds, .tid = (uint32_t)gettid(),
                          .flags = SB_F_MAGIC };
     struct iovec iov[2] = { { &h, sizeof h }, { (void *)body, blen } };
-    char cbuf[CMSG_SPACE(sizeof(int) * 8)];
+    char cbuf[CMSG_SPACE(sizeof(int) * SB_MAXFDS)];   /* ★ Р-133: было на 8 — см. SB_MAXFDS */
     struct msghdr m;
     memset(&m, 0, sizeof m);
     m.msg_iov = iov;
     m.msg_iovlen = blen ? 2 : 1;
+    if (nfds > SB_MAXFDS) { errno = E2BIG; return -1; }   /* собирающий сам не даёт больше — сторож */
     if (nfds > 0) {
         memset(cbuf, 0, sizeof cbuf);
         m.msg_control = cbuf;
@@ -988,7 +1191,7 @@ static int dsend(struct thr *t, uint16_t type, const void *body, uint32_t blen,
 static int drecv(struct thr *t, uint8_t **bufp, size_t cap, int *fds, int *nfds) {
     *nfds = 0;
     struct sb_hdr h;
-    char cbuf[CMSG_SPACE(sizeof(int) * 8)];
+    char cbuf[CMSG_SPACE(sizeof(int) * SB_MAXFDS)];   /* ★ Р-133: было на 8 — девятый описатель ядро закрывало (MSG_CTRUNC) */
     struct iovec iov = { &h, sizeof h };
     struct msghdr m;
     memset(&m, 0, sizeof m);
@@ -1017,8 +1220,12 @@ static int drecv(struct thr *t, uint8_t **bufp, size_t cap, int *fds, int *nfds)
     for (struct cmsghdr *cm = CMSG_FIRSTHDR(&m); cm; cm = CMSG_NXTHDR(&m, cm)) {
         if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS) continue;
         int cnt = (int)((cm->cmsg_len - CMSG_LEN(0)) / sizeof(int));
-        for (int i = 0; i < cnt && *nfds < 8; i++)
-            memcpy(&fds[(*nfds)++], CMSG_DATA(cm) + i * sizeof(int), sizeof(int));
+        for (int i = 0; i < cnt; i++) {
+            int fd;
+            memcpy(&fd, CMSG_DATA(cm) + i * sizeof(int), sizeof(int));
+            if (*nfds < SB_MAXFDS) fds[(*nfds)++] = fd;
+            else close(fd);                  /* ★ Р-133: сверх предела не бросаем открытым (сверка ниже скажет) */
+        }
     }
     /*
      * ★★ СКОЛЬКО ОПИСАТЕЛЕЙ ОБЕЩАНО В ЗАГОЛОВКЕ — СТОЛЬКО И ДОЛЖНО ПРИЙТИ.
@@ -1103,6 +1310,11 @@ static int drecv(struct thr *t, uint8_t **bufp, size_t cap, int *fds, int *nfds)
         if (k < 0 && errno == EINTR) continue;      // тело сообщения — так же
         if (k <= 0) return -1;
         got += (size_t)k;
+    }
+    /* ★ Р-128в: принята односторонняя — слот демона теперь у неё (см. async_on_received) */
+    if (h.type == SB_R_TRANSACTION && blen >= sizeof(struct sb_txn) &&
+        (((const struct sb_txn *)(buf + sizeof h))->flags & TF_ONE_WAY)) {
+        async_on_received(t);
     }
     return (int)(sizeof h + blen);
 }
@@ -1374,8 +1586,6 @@ static int msg_to_br(struct thr *t, struct sess *s, uint8_t *msg, int *fds, int 
                       (unsigned long long)m->data_size, ob, sn);
             }
         }
-        // ★ Односторонняя пошла гостю — в начале следующего ioctl отчитаемся.
-        if (m->flags & TF_ONE_WAY) t->async_pending = 1;
         memcpy(buf, data, (size_t)m->data_size);
         if (noff) {
             const uint64_t *wo = (const uint64_t *)(data + m->data_size);
@@ -1466,6 +1676,13 @@ static int msg_to_br(struct thr *t, struct sess *s, uint8_t *msg, int *fds, int 
          * порядке, в каком пришли.
          */
         if (cmd == BR_TRANSACTION) {
+            /*
+             * ★★★★★ Односторонняя пошла гостю — запоминаем её буфер: «узел
+             * свободен» скажем, когда гость его вернёт (см. thr.async_buf, Р-128).
+             * ⚠️ ПОСЛЕ out_put: не влезшую в буфер чтения не запоминаем — её
+             * отдадим позже, и учёт заведётся с новым буфером.
+             */
+            if ((m->flags & TF_ONE_WAY) && !t->orphan_msg) async_hold(t, s, (uint64_t)(uintptr_t)buf);
             if (t->in_txn < (int)(sizeof t->inbuf / sizeof t->inbuf[0])) {
                 t->incode[t->in_txn] = m->code;
                 t->inbuf[t->in_txn++] = (uint64_t)(uintptr_t)buf;
@@ -1537,9 +1754,16 @@ static int drecv_to(struct thr *t, uint8_t **bufp, size_t cap, int *fds, int *nf
  * целиком и больше эти команды не пришлёт. Если в остатке была
  * BC_TRANSACTION, отправитель об этом не узнает НИКОГДА — для односторонней
  * посылки вызов «удался».
+ *
+ * ★★★★★ Р-143: команду, которой драйвер НЕ ПОДДЕРЖИВАЕТ, отмечаем в *unsup —
+ * вызывающий отвечает гостю EINVAL, как ядро (см. bc_unsupported). Возврат в
+ * этом случае — смещение НАЧАЛА этой команды: всё до неё исполнено.
  */
-static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t wlen) {
+static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t wlen,
+                         int *unsup, uint32_t *unsup_cmd) {
     size_t off = 0;
+    *unsup = 0;
+    *unsup_cmd = 0;
     while (off + 4 <= wlen) {
         uint32_t cmd;
         memcpy(&cmd, w + off, 4);
@@ -1656,10 +1880,16 @@ static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t
                 }
             }
             // Описатели вынимаем из объектов и отправляем через SCM_RIGHTS.
-            int fds[8]; int nfds = 0;
+            /*
+             * ★★★ Р-133: до SB_MAXFDS (предел SCM_RIGHTS ядра), а не до восьми. Встроенный браузер прошивки
+             * отдаёт дочернему процессу в setupConnection ДЕВЯТЬ описателей; девятый здесь молча
+             * отбрасывался, демон отказывал всей посылке («объект FD №8 без описателя»), GPU-процесс не
+             * подключался — и через 10 с браузер падал на «Timed out waiting for GPU channel».
+             */
+            int fds[SB_MAXFDS]; int nfds = 0, nfdobj = 0;
             if (osz) {
                 uint64_t *offs = (uint64_t *)(b + sizeof *m + dsz);
-                for (uint64_t i = 0; i < noff && nfds < 8; i++) {
+                for (uint64_t i = 0; i < noff; i++) {
                     // ⚠️ Смещение обязано быть проверено ДО разыменования.
                     // Настоящий драйвер делает ровно это в binder_transaction():
                     // объект целиком внутри данных и выровнен, иначе
@@ -1673,9 +1903,14 @@ static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t
                     }
                     struct flat_binder_object *fo =
                         (struct flat_binder_object *)(b + sizeof *m + offs[i]);
-                    if (fo->type == BINDER_TYPE_FD) fds[nfds++] = (int)fo->handle;
+                    if (fo->type != BINDER_TYPE_FD) continue;
+                    nfdobj++;
+                    if (nfds < SB_MAXFDS) fds[nfds++] = (int)fo->handle;
                 }
             }
+            if (nfdobj > nfds)
+                bwarn("binder: ★★★ Р-133: описателей в посылке %d — больше предела %d; демон откажет ей "
+                      "(код=%u данные=%zu)", nfdobj, SB_MAXFDS, (unsigned)tr->code, dsz);
             /*
              * ★ Вторая половина переписи: что гость ОТПРАВЛЯЕТ. Без неё нельзя
              * отличить «приложение не ответило» от «ответ потерялся по дороге»:
@@ -1873,8 +2108,25 @@ static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t
                     if (!obj_off_ok(offs[i], (size_t)dsz)) break;
                     const struct flat_binder_object *fo =
                         (const struct flat_binder_object *)(base + offs[i]);
+                    if (fo->type == BINDER_TYPE_BINDER || fo->type == BINDER_TYPE_WEAK_BINDER) {
+                        /*
+                         * ★★★ Р-134: свой объект вернулся «домой» — демон держит его узел, пока мы не
+                         * дочитали посылку (как драйвер: binder_inc_node при переводе, снятие — здесь же,
+                         * в binder_transaction_buffer_release). Прежде ссылки тут не заводилось, и демон
+                         * отпускал объект, пока посылка ещё ждала очереди: system_server удалял маркер
+                         * службы и читал его адрес из serviceDoneExecuting — SIGBUS в RefBase::incStrong.
+                         * ptr/cookie — как в объекте (32-битные, расширяем нулями, как узел у демона).
+                         */
+                        struct sb_ptr_cookie nf = {
+                            .op = (fo->type == BINDER_TYPE_BINDER) ? 1u : 0u,
+                            .ptr = (uint64_t)fo->binder,
+                            .cookie = (uint64_t)fo->cookie,
+                        };
+                        dsend(t, SB_NODE_FREE, &nf, sizeof nf, NULL, 0);
+                        continue;
+                    }
                     if (fo->type != BINDER_TYPE_HANDLE && fo->type != BINDER_TYPE_WEAK_HANDLE)
-                        continue;   // свой объект вернулся домой — ссылки не заводилось
+                        continue;   // описатель — ссылки не заводилось
                     struct sb_ref r = { .op = (fo->type == BINDER_TYPE_HANDLE)
                                                 ? SB_REF_RELEASE_BUF : SB_REF_DECREFS_BUF,
                                          .handle = fo->handle };
@@ -1892,6 +2144,13 @@ static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t
                 break;
             }
             buf_free(s, addr);
+            /*
+             * ★★★★★ Р-128: если это буфер односторонней — узел свободен, демон
+             * может отдавать следующую. Так отпускает узел и настоящий драйвер.
+             * ⚠️ Вне условия GUEST_NO_FREEBUF: оно отключает только снятие
+             * ссылок, а сериализацию односторонних трогать не должно.
+             */
+            async_on_free(t, s, addr);
             break;
         }
         case BC_INCREFS: case BC_ACQUIRE: case BC_RELEASE: case BC_DECREFS: {
@@ -1957,12 +2216,63 @@ static size_t bc_process(struct thr *t, struct sess *s, const uint8_t *w, size_t
             if (s) s->closes_death = 1;
             break;
         }
+        /*
+         * ★★★★★ Р-143: BC_ATTEMPT_ACQUIRE и BC_ACQUIRE_RESULT драйвер НЕ
+         * ПОДДЕРЖИВАЛ НИКОГДА — `binder_thread_write` печатает «… not supported»
+         * и отвечает -EINVAL. А ранние libbinder первую шлют: promote() слабой
+         * ссылки на посредника, у которого не осталось сильных, идёт в
+         * IPCThreadState::attemptIncStrongHandle — [BC_ATTEMPT_ACQUIRE 0 описатель]
+         * и waitForResponse ждёт BR_ACQUIRE_RESULT. Шим считал буфер разобранным
+         * и уходил ждать работу — ответа не придёт никогда. У 1.5/1.6 так вставал
+         * поток микшера AudioFlinger (checkA2dpEnabledChange_l → promote клиента)
+         * ПОД замком AudioFlinger, а за ним setRouting и вся загрузка на «Starting
+         * Audio Service». Ветка default — то же самое у ядра: «unknown command»,
+         * -EINVAL. Отвечает вызывающий (binder_write_read), здесь — отметка.
+         */
+        case BC_ATTEMPT_ACQUIRE:
+        case BC_ACQUIRE_RESULT:
         default:
-            glog("binder: команда BC 0x%x не поддержана", cmd);
+            *unsup = 1;
+            *unsup_cmd = cmd;
             return off - 4;
         }
     }
     return off;
+}
+
+/* Имя неподдержанной команды для журнала. */
+static const char *bc_unsupported_name(uint32_t cmd) {
+    return cmd == BC_ATTEMPT_ACQUIRE ? "BC_ATTEMPT_ACQUIRE"
+         : cmd == BC_ACQUIRE_RESULT ? "BC_ACQUIRE_RESULT" : "неизвестная";
+}
+
+/*
+ * ★★★★★ Р-143: ответ на неподдержанную команду — РОВНО как у драйвера.
+ *
+ * `binder_thread_write` на такой команде выходит с -EINVAL, `*consumed` к этому
+ * мигу указывает на её НАЧАЛО (обновляется после каждой исполненной), ioctl
+ * копирует bwr обратно с read_consumed = 0 и до чтения не доходит. Команды
+ * перед ней исполнены. libbinder на ошибку bwr не смотрит и mOut не чистит:
+ * waitForResponse отдаёт ошибку, attemptIncStrongHandle — неуспех, promote() —
+ * пустой указатель, вызывающий идёт дальше. Команда остаётся в mOut, и каждый
+ * следующий заход этого потока получит тот же EINVAL — так было и на живом
+ * аппарате, это поведение прошивки, а не наше.
+ *
+ * ⚠️ Журнал — с пределом: поток, оставшийся с такой командой в mOut, повторяет
+ * её на каждом заходе. Первые восемь и дальше на степенях двойки.
+ */
+static int bc_unsupported(struct binder_write_read *bwr, size_t used, uint32_t cmd) {
+    static unsigned n_unsup;
+    unsigned n = __atomic_add_fetch(&n_unsup, 1, __ATOMIC_RELAXED);
+    if (n <= 8 || (n & (n - 1)) == 0)
+        bwarn("binder: ★★★ команда %s (0x%x) драйвером не поддерживается — отказ EINVAL, "
+              "как у ядра: разобрано %zu из %llu байт, чтения нет (всего таких %u)",
+              bc_unsupported_name(cmd), (unsigned)cmd, used,
+              (unsigned long long)bwr->write_size, n);
+    bwr->write_consumed = used;
+    bwr->read_consumed = 0;
+    errno = EINVAL;
+    return -1;
 }
 
 // --------------------------------------------------------- сам ioctl
@@ -2016,21 +2326,44 @@ static void dq_flush(struct thr *t, struct sess *s, struct outbuf *o) {
      * падает, если `scheduleReceiver` обгонит `bindApplication`.
      */
     if (s) {
+        /*
+         * ⚠️★★★ msg_to_br — БЕЗ замка сессии. Он зовёт buf_alloc/buf_note и
+         * async_hold, а те берут тот же НЕрекурсивный `s->lock`: звать его с
+         * замком в руках значило встать навсегда, едва `s->dq` непуст (очередь
+         * наполняет thr_free при уходе нити с отложенным). Поэтому очередь
+         * забираем ЦЕЛИКОМ под замком, разбираем без него, а что не влезло —
+         * кладём обратно в НАЧАЛО очереди процесса: порядок не меняется, а
+         * пока список у одной нити, другая его не видит и повторно не отдаст.
+         */
+        struct qmsg *rest;
         pthread_mutex_lock(&s->lock);
-        while (s->dq) {
-            struct qmsg *q = s->dq;
-            int fds0[8], nfds0 = 0;
-            if (msg_to_br(t, s, q->buf, fds0, nfds0, o) < 0) break;  // не влезло — в другой раз
-            s->dq = q->next;
-            if (!s->dq) s->dq_tail = &s->dq;
+        rest = s->dq;
+        s->dq = NULL;
+        s->dq_tail = &s->dq;
+        pthread_mutex_unlock(&s->lock);
+        while (rest) {
+            struct qmsg *q = rest;
+            int nfds0 = 0, r;                  /* описателей у отложенного нет: с ними откладывать нельзя */
+            t->orphan_msg = 1;                 /* ★ Р-128в: сирота — «разобрал» для неё не заводим (см. thr.orphan_msg) */
+            r = msg_to_br(t, s, q->buf, NULL, nfds0, o);
+            t->orphan_msg = 0;
+            if (r < 0) break;                  // не влезло — в другой раз
+            rest = q->next;
             free(q);
         }
-        pthread_mutex_unlock(&s->lock);
+        if (rest) {
+            struct qmsg **tl = &rest;
+            while (*tl) tl = &(*tl)->next;
+            pthread_mutex_lock(&s->lock);
+            *tl = s->dq;                       // что положили за это время — после остатка
+            if (!s->dq) s->dq_tail = tl;
+            s->dq = rest;
+            pthread_mutex_unlock(&s->lock);
+        }
     }
     while (t->dq) {
         struct qmsg *q = t->dq;
-        int fds[8], nfds = 0;
-        if (msg_to_br(t, s, q->buf, fds, nfds, o) < 0) return;   // не влезло — ждёт дальше
+        if (msg_to_br(t, s, q->buf, NULL, 0, o) < 0) return;   // не влезло — ждёт дальше (описателей у отложенного нет)
         t->dq = q->next;
         if (!t->dq) t->dq_tail = &t->dq;
         free(q);
@@ -2182,23 +2515,30 @@ static int binder_write_read(struct thr *t, struct sess *s, struct binder_write_
     if (g_verbose) glog("binder: WR вход tid=%d запись=%llu чтение=%llu", gettid(),
                         (unsigned long long)bwr->write_size, (unsigned long long)bwr->read_size);
     /*
-     * ★★★★★ «Предыдущую одностороннюю разобрал». Шлём ПЕРВЫМ делом: между
-     * прошлым ioctl и этим libbinder выполнил executeCommand целиком, значит
-     * сообщение уже легло в очередь главного потока и порядок зафиксирован.
-     * Пока демон этого не услышит, следующую одностороннюю к тому же узлу он
-     * не выдаст — иначе scheduleBindService обгоняет scheduleCreateService.
+     * ★★★★★ «Одностороннюю разобрал» — ТОЛЬКО по признаку, а не по самому
+     * факту нового ioctl (Р-128).
+     *
+     * ⚠️ ИСТОРИЯ. Здесь стояло безусловное «шлём ПЕРВЫМ делом: между прошлым
+     * ioctl и этим libbinder выполнил executeCommand целиком». Это неверно,
+     * когда обработчик односторонней сам зовёт binder: следующий ioctl
+     * случается ВНУТРИ обработчика (`bindApplication` → PackageManager), демон
+     * отпускал узел раньше времени и отдавал следующую одностороннюю другому
+     * потоку — CREATE_SERVICE обгоняла BIND_APPLICATION. Теперь «разобрал»
+     * уходит из ветки BC_FREE_BUFFER (async_on_free), как у настоящего
+     * драйвера, а здесь остаётся лишь долг, который в тот миг отдать было
+     * нельзя: буфер вернула другая нить (она не пишет в наш сокет) либо таблица
+     * односторонних полна (учёта нет — остаётся прежний расчёт).
      */
-    if (t->async_pending && t->fd >= 0) {
-        struct sb_hdr ah = { .len = sizeof ah, .type = SB_ASYNC_DONE,
-                              .tid = (uint32_t)gettid(), .flags = SB_F_MAGIC };
-        t->async_pending = 0;
-        (void)!write(t->fd, &ah, sizeof ah);
-    }
+    if (__atomic_exchange_n(&t->async_flush, 0, __ATOMIC_ACQ_REL)) async_done_send(t);
     t->sent = 0;
     t->will_read = bwr->read_size > 0;
     if (bwr->write_size) {
+        int unsup;
+        uint32_t unsup_cmd;
         size_t used = bc_process(t, s, (const uint8_t *)(uintptr_t)bwr->write_buffer,
-                                 (size_t)bwr->write_size);
+                                 (size_t)bwr->write_size, &unsup, &unsup_cmd);
+        // ★ Р-143: неподдержанная драйвером команда — EINVAL, как у ядра, без чтения.
+        if (unsup) return bc_unsupported(bwr, used, unsup_cmd);
         /*
          * ★★★ СТОРОЖ НЕДОРАЗОБРАННОГО БУФЕРА.
          *
@@ -2251,7 +2591,7 @@ static int binder_write_read(struct thr *t, struct sess *s, struct binder_write_
         waited = 1;
         if (t->fd < 0 || write(t->fd, &wh, sizeof wh) != (ssize_t)sizeof wh) { errno = gone_errno(s); return -1; }
         uint8_t stackmsg[SB_PEND], *msg = stackmsg;
-        int fds[8], nfds = 0;
+        int fds[SB_MAXFDS], nfds = 0;
         int n = drecv_to(t, &msg, sizeof stackmsg, fds, &nfds, 30000, "жду подтверждение посылки");
         if (n == -2) {
             // Подтверждения нет полминуты. Считаем посылку принятой: гостю
@@ -2358,7 +2698,7 @@ static int binder_write_read(struct thr *t, struct sess *s, struct binder_write_
             return -1;
         }
         uint8_t stackmsg[SB_PEND], *msg = stackmsg;
-        int fds[8], nfds = 0;
+        int fds[SB_MAXFDS], nfds = 0;
         int n;
         if (rescue) {
             n = drecv_to(t, &msg, sizeof stackmsg, fds, &nfds, GUEST_STUCK_MS, "жду работу");
@@ -2440,7 +2780,8 @@ static int binder_write_read(struct thr *t, struct sess *s, struct binder_write_
                       "код=%u флаги=0x%x цель=%u) — потеря %s, %s",
                       t->looper, t->in_txn, t->in_death, t->pending_sync, t->tx_total,
                       t->cpl_given,
-                      t->sent, t->completes, t->lost, t->async_pending,
+                      t->sent, t->completes, t->lost,
+                      (t->async_buf != 0 || t->async_flush != 0),
                       t->last_code, t->last_flags, t->last_handle,
                       ours ? "НАША" : "у гостя",
                       ours ? "выдаю подтверждение"
@@ -2503,7 +2844,7 @@ static int binder_ioctl(int fd, unsigned long req, void *arg, int *ret) {
         return 1;
     case BINDER_SET_CONTEXT_MGR: {
         dsend(t, SB_SET_CTX_MGR, NULL, 0, NULL, 0);
-        uint8_t stackmsg[256], *msg = stackmsg; int fds[8], nfds = 0;
+        uint8_t stackmsg[256], *msg = stackmsg; int fds[SB_MAXFDS], nfds = 0;
         int n = drecv(t, &msg, sizeof stackmsg, fds, &nfds);
         struct sb_hdr *h = (struct sb_hdr *)msg;
         if (n < 0 || h->type != SB_R_OK) { *ret = -1; errno = EBUSY; }
@@ -2566,7 +2907,7 @@ static int binder_mmap(int fd, size_t len, abi_ulong *out) {
 // /dev/binder, обрабатывается здесь; остальное qemu делает как обычно.
 
 /* Открытие: 1 — это наш путь, в *fd лежит результат. */
-int guest_binder_try_open(const char *path, int *fd)
+int guest_binder_try_open(const char *path, int flags, int *fd)
 {
     // Отметки atrace прошивки — в нашу трассу (см. guest_trace.c).
     if (guest_trace_try_open(path, fd)) {
@@ -2587,8 +2928,10 @@ int guest_binder_try_open(const char *path, int *fd)
         return 1;
     }
     // Группы планировщика: гость должен читать свой /proc/<tid>/cgroup, а не
-    // хозяйский (см. guest_fs.c) — иначе Dalvik заваливает лог жалобами.
-    if (guest_fs_try_open(path, fd)) {
+    // хозяйский (см. guest_fs.c) — иначе Dalvik заваливает лог жалобами. Там же —
+    // узлы ожидания экрана /sys/power/wait_for_fb_* (Р-137): им нужны флаги гостя
+    // (O_NONBLOCK, O_CLOEXEC, режим доступа), поэтому их передаёт патч 0006.
+    if (guest_fs_try_open(path, flags, fd)) {
         return 1;
     }
     if (!path || strcmp(path, "/dev/binder") != 0) {

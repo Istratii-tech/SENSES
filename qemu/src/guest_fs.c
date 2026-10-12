@@ -9,7 +9,7 @@
 // Everything changed in QEMU is listed in NOTICE.
 //
 // Copyright (c) 2026 istratiitech <https://github.com/istratiitech>
-// Changed: 2026-08-29 … 2026-10-05
+// Changed: 2026-08-29 … 2026-10-10
 
 /* guest_fs.c — гостю показываем ЕГО раздел, а не диск телефона.
  *
@@ -40,9 +40,11 @@
 #include "qemu/osdep.h"
 #include "qemu.h"
 #include "user-internals.h"
+#include "qemu/path.h"
 
 #include <sys/vfs.h>
 #include <sys/syscall.h>
+#include <sys/socket.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -295,6 +297,26 @@ static const struct {
     { "/proc/net/xt_qtaguid/stats",  QTAGUID_TEXT },
     { "/proc/net/xt_qtaguid/iface_stat_fmt", QTAGUID_IFACE_FMT_TEXT },
     { "/proc/net/xt_qtaguid/iface_stat_all", "" },      /* у этого заголовка нет */
+    /*
+     * ★★★★★ Р-129: `ctrl` — управляющий файл учёта трафика ядра. Читать из него нечего
+     * (пусто), а писать гость пишет всегда: метки сокетов («t <сокет> <метка> <uid>»),
+     * наборы счётчиков («s <набор> <uid>»), удаление («d …»). Открытие отдаёт память: запись
+     * принимается целиком (код = длина) и выбрасывается при закрытии, до ядра ХОЗЯИНА она не
+     * доходит никогда — то, чего в Р-32 (патч 0069) боялись от «учёта, который включается».
+     *
+     * Зачем он вообще есть. NetworkManagementService (6.0) решает «в ядре есть учёт» по
+     * `new File("/proc/net/xt_qtaguid/ctrl").exists()`; найдя файл и выполнив `bandwidth
+     * enable` у netd (тот зовёт iptables — у гостя пустышка «успех», см. Tree.firewallStubs),
+     * он опускает защёлку, на которой висит КАЖДЫЙ `isBandwidthControlEnabled()` до 30 с.
+     * Без файла защёлка не опускалась НИКОГДА: «Настройки» открывались 33 с.
+     *
+     * ⚠️ `stat`/`access` отвечает не этот файл, а ДЕРЕВО: каталог /proc/net/xt_qtaguid патч
+     * 0069 уводит в дерево безусловно, и там стенд кладёт метки обычных файлов (Tree.
+     * makeQtaguid) — тот же приём, что у /dev/alarm (открытие перехватываем по гостевому
+     * имени, существование и права берутся у метки). Раньше метки не было: `stat` отвечал
+     * ENOENT, и `File.exists()` гостя давал false у ВСЕХ четырёх файлов этой группы.
+     */
+    { "/proc/net/xt_qtaguid/ctrl", "" },
 };
 
 /*
@@ -357,10 +379,152 @@ static int give_text(const char *text, size_t len, int *fd)
     return 1;
 }
 
-int guest_fs_try_open(const char *path, int *fd)
+/*
+ * ★★★★★ Р-137: УЗЛЫ ОЖИДАНИЯ ЭКРАНА — /sys/power/wait_for_fb_sleep и …_wake.
+ *
+ * Композитор прошивки 4.0.3 заводит поток ожидания БЕЗ проверки access(): открывает узел, читает из него один байт и ждёт, пока экран погаснет
+ * (или зажжётся). Узла у стенда нет — и нарочно: обычный файл отвечает сразу и крутит ТОТ ЖЕ поток (целое ядро процессора), а у прошивок с
+ * libsuspend его появление включает ожидание сна в autosuspend_enable — управление питанием ПОВИСАЕТ (Tree.makeSysNodes, память проекта). Без узла
+ * open() даёт −1, read(−1) — EBADF, поток пишет «ANDROID_WAIT_FOR_FB_SLEEP failed (Bad file number)» и тут же повторяет: 334 тыс. строк журнала
+ * (316 МБ) за 3,5 минуты и ядро занято.
+ *
+ * Поэтому открытие РОВНО этих двух имён, когда узла в дереве нет, отдаёт описатель, который отвечает как узел ядра при ЗАЖЖЁННОМ экране (экран
+ * стенда не гаснет никогда):
+ *   * wait_for_fb_sleep — «ждать, пока экран погаснет»: чтение СПИТ вечно (ни байта, ни конца файла), O_NONBLOCK даёт EAGAIN;
+ *   * wait_for_fb_wake — «ждать, пока экран зажжётся»: он уже зажжён, и ядро отвечает сразу строкой «awake» (5 байт, как sysfs: затем конец файла).
+ * ⚠️ Узлы НЕ одинаковы, и это не прихоть. Оба спящими сделал бы «по картинке» — «экран не засыпает, ждать нечего», — но ядро (fbearlysuspend.c) на
+ * wait_for_fb_wake при горящем экране не ждёт: условие ожидания — «экран горит». Прошивка, что читает его сама (у №2 заставка, 23.09: «и без узла
+ * проходит», книга 9.25), на спящем узле встала бы насмерть: на аппарате ответ мгновенный, без узла — ENOENT, и так и так она идёт дальше. Потоки
+ * ожидания (SurfaceFlinger 4.0.3, libsuspend) читают sleep ПЕРВЫМ и до wake не доходят: стоит sleep — стоят оба.
+ *
+ * Правило узкое:
+ *   * имя — по ГОСТЕВОМУ пути (до перевода), целиком, без нормализации: «/sys/power/wait_for_fb_sleep2», «//sys/…», относительные — не наши;
+ *   * узел в дереве есть — не наш (открывается обычным путём: так поведёт себя любое дерево, где его кто-то положил ради чего-то иного);
+ *   * stat/access отвечает дерево (ENOENT): прошивки, что проверяют access() до открытия, поведения не меняют вовсе — это главное.
+ *
+ * ★ Что за описатель.
+ *   * sleep — НЕИМЕННЫЙ ДАТАГРАММНЫЙ СОКЕТ AF_UNIX без пары: ОДИН описатель хозяина на открытие и больше ничего. Чтение из него спит, пока не придёт
+ *     датаграмма, а прийти ей неоткуда (адреса у сокета нет, и никто его не узнает), конца файла у датаграммного сокета без соединения не бывает;
+ *     O_NONBLOCK даёт EAGAIN. Закрыл гость описатель — не осталось ничего.
+ *     ⚠️ Прежняя редакция (Р-137) отдавала конец чтения ТРУБЫ, а конец записи держала открытым до конца процесса (закрой его — читатель получил бы
+ *     конец файла и закрутился). Это копило описатели хозяина на каждое открытие (цикл «открыл-прочёл-закрыл» при неблокирующем чтении или повтор
+ *     после EINTR вёл к EMFILE) и показывало гостю в /proc/self/fd чужую трубу, которой патч 0094 не прячет. Выбор из трёх путей: (а) «один конец
+ *     записи на процесс» — читатели одной трубы делят описание открытого файла, O_NONBLOCK одного стал бы неблокирующим для всех (спящие потоки закрутились
+ *     бы), а переоткрытие через /proc/self/fd/N требует согласованного close-on-exec у главного писателя и каждого читателя; (б) «закрывать писателя вместе
+ *     с читателем» — у закрытия гостя нет места для этого без ошибки: dup() читателя, переживший исходный, получил бы конец файла; (в) сокет без пары:
+ *     писателя нет вообще, закрывать и прятать нечего. Выбрано (в). Не eventfd (гость читает ОДИН байт — eventfd ответит EINVAL) и не inotify (то же).
+ *     `socket` — в списке песочницы Android 9 (tests/qemu/seccomp9.txt); SELinux: создание unix_dgram_socket разрешено каждому приложению (так пишет в
+ *     журнал liblog через logdw).
+ *   * wake — конец чтения ТРУБЫ: «awake» кладётся в неё сразу, конец записи закрывается тут же — читатель получает пять байт, потом конец файла.
+ *     Писателя у вечно живущего описателя нет: он закрыт до выдачи.
+ * Не memfd у sleep (его чтение — конец файла сразу). Описатель у КАЖДОГО открытия свой, а не одна труба на процесс с копиями: копии делят описание
+ * открытого файла, и O_NONBLOCK (флаг открытия или fcntl(F_SETFL) одного читателя) сделал бы неблокирующим и всех остальных. Закрытие своего
+ * описателя ничьего сна не будит.
+ *
+ * Описатель наследуется при exec ровно тогда, когда гость не просил O_CLOEXEC: он один, и флаг у него гостя. Только чтение: открытие на запись —
+ * EACCES, как у атрибута ядра S_IRUGO.
+ */
+static const struct {
+    const char *name;
+    int sleeps;                         /* 1 — чтение спит вечно; 0 — ответ сразу (экран горит) */
+} FBWAIT_NODES[] = {
+    { "/sys/power/wait_for_fb_sleep", 1 },
+    { "/sys/power/wait_for_fb_wake",  0 },
+};
+
+/* Ответ узла wait_for_fb_wake при горящем экране — как у ядра (sysfs отдаёт ровно эти пять байт, без перевода строки). */
+static const char FBWAIT_AWAKE[] = "awake";
+
+/* Номер узла по гостевому пути; −1 — не узел ожидания. */
+static int fbwait_node(const char *gpath)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(FBWAIT_NODES); i++) {
+        if (!strcmp(gpath, FBWAIT_NODES[i].name)) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+/* Есть ли узел в дереве гостя: /sys у гостя целиком под его корнем (патч 0059), и path() ведёт туда безусловно. */
+static int fbwait_in_tree(const char *gpath)
+{
+    const char *host = path(gpath);
+
+    return host && access(host, F_OK) == 0;
+}
+
+/* Флаги гостя → описатель [d]: O_NONBLOCK и close-on-exec. 0 — готово, −1 — fcntl отказал (errno выставлен). */
+static int fbwait_flags(int d, int flags)
+{
+    if ((flags & O_NONBLOCK) && fcntl(d, F_SETFL, fcntl(d, F_GETFL) | O_NONBLOCK) < 0) {
+        return -1;
+    }
+    return fcntl(d, F_SETFD, (flags & O_CLOEXEC) ? FD_CLOEXEC : 0);
+}
+
+/* wait_for_fb_sleep: безымянный датаграммный сокет без пары — чтение спит вечно, писателя нет (см. шапку). */
+static int fbwait_open_sleep(int flags)
+{
+    int d = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int e;
+
+    if (d < 0) {
+        return -1;                          /* errno уже выставлен (EMFILE, ENFILE, EACCES) */
+    }
+    if (fbwait_flags(d, flags) < 0) {
+        e = errno;
+        close(d);
+        errno = e;
+        return -1;
+    }
+    return d;
+}
+
+/* wait_for_fb_wake: экран горит — ядро отвечает сразу «awake» и дальше отдаёт конец файла. Пять байт в пустую трубу не ждут. */
+static int fbwait_open_wake(int flags)
+{
+    int p[2];
+    int e;
+
+    if (pipe2(p, O_CLOEXEC) < 0) {
+        return -1;
+    }
+    if (write(p[1], FBWAIT_AWAKE, sizeof FBWAIT_AWAKE - 1) != (ssize_t)(sizeof FBWAIT_AWAKE - 1) || fbwait_flags(p[0], flags) < 0) {
+        e = errno;
+        close(p[0]);
+        close(p[1]);
+        errno = e;
+        return -1;
+    }
+    close(p[1]);                            /* писатель закрыт до выдачи: у wake после «awake» — конец файла */
+    return p[0];
+}
+
+/* Описатель узла ожидания номер [node]: 1 — перехвачено, в *fd описатель или −1 (errno выставлен). */
+static int fbwait_open(int node, int flags, int *fd)
+{
+    if ((flags & O_ACCMODE) != O_RDONLY) {
+        errno = EACCES;
+        *fd = -1;
+        return 1;
+    }
+    *fd = FBWAIT_NODES[node].sleeps ? fbwait_open_sleep(flags) : fbwait_open_wake(flags);
+    return 1;
+}
+
+int guest_fs_try_open(const char *path, int flags, int *fd)
 {
     size_t n;
 
+    /* Раньше раннего выхода «не /proc»: узлы — в /sys. */
+    if (path) {
+        int node = fbwait_node(path);
+
+        if (node >= 0 && !fbwait_in_tree(path)) {
+            return fbwait_open(node, flags, fd);
+        }
+    }
     if (!path || strncmp(path, "/proc/", 6)) {
         return 0;
     }
@@ -439,6 +603,20 @@ int guest_fs_try_open(const char *path, int *fd)
         if (!strcmp(look, SUBST[i].path)) {
             return give_text(SUBST[i].text, strlen(SUBST[i].text), fd);
         }
+    }
+    /*
+     * ★★★ Р-129б (проверка Р-129, Важное 1): ПРИЁМНИК ЗАПИСИ ДЛЯ КВОТ ТРАФИКА — /proc/net/xt_quota/<имя>.
+     *
+     * Когда `bandwidth enable` у netd проходит (Р-129: ctrl «есть», iptables отвечает успехом), повторный
+     * `setglobalalert` и квоты идут не в iptables, а в `updateQuota`: `fopen("/proc/net/xt_quota/<имя>", "w")`
+     * (имя — `globalAlert` или имя квоты интерфейса). Раньше этот путь никуда не уводился, и запись шла в учёт
+     * ядра ХОЗЯИНА — ровно то, от чего уходил Р-32 (шапка патча 0069); на Android 9 к тому же строка avc в журнале
+     * телефона, а в летописи — «problem registering for global alert … setglobalalert … failed». Теперь открытие
+     * по ЛЮБОМУ имени под /proc/net/xt_quota/ — память (как у ctrl): запись принимается целиком и выбрасывается
+     * при закрытии, читать нечего. Псевдоним /proc/self/net/… — через ту же `look`.
+     */
+    if (!strncmp(look, "/proc/net/xt_quota/", 19) && look[19]) {
+        return give_text("", 0, fd);
     }
     n = strlen(path);
     if (n < 7 || strcmp(path + n - 7, "/cgroup")) {
