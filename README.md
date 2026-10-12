@@ -1,4 +1,6 @@
-# SENSES — QEMU source distribution
+# ISTRATII_TECH SENSES - QEMU source distribution
+
+[![Telegram](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/istratii_tech ) [![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/5HWuRWdKwt)
 
 This repository exists to satisfy the **GNU GPL version 2** obligations that
 come with distributing a modified QEMU.
@@ -8,9 +10,31 @@ an ARM64 phone by translating its individual processes — there is no guest
 kernel. The translator is a modified QEMU, and **that is what this repository
 contains**: our patches, our added source files, and the script that builds it.
 
+MADE WITH CLAUDE CODE
+
 Repository: `https://github.com/Istratii-tech/Senses`.
 Requests for sources: issues of this repository
 (`https://github.com/Istratii-tech/Senses/issues`) or `https://t.me/istratii_tech`.
+
+## Instructions
+
+Инструкция как использовать SENSES Emulator
+
+1. Скачать прошивку которую хотите запустить
+2. Положить файл прошивки в папку ISTRATII_TECH_SENSES в корне вашего телефона
+3. Запустить эмулятор (он сам может предложить распаковку) и нажать на нижней панели SENSES -> Fimware -> нажать плюс -> выбрать файл вашей прошивки -> нажать распаковать
+4. После распаковки нажимаете SENSES -> Start
+5. Для остановки нажимаете SENSES -> Stop
+
+How to Use SENSES Emulator: A Step-by-Step Guide
+
+1. Download the firmware you want to run
+2. Place the firmware file into the ISTRATII_TECH_SENSES folder in the root directory of your phone
+3. Launch the emulator (it may automatically prompt you to extract the files) and follow these steps on the bottom panel:
+Tap SENSES -> Firmware -> tap the plus (+) icon
+Select your firmware file and tap Extract
+4. Once extracted, tap SENSES -> Start to begin
+5. To stop the emulator, tap SENSES -> Stop
 
 ## What is *not* here
 
