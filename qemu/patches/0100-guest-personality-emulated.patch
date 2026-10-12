@@ -1,0 +1,63 @@
+Личность гостя PER_LINUX32 изображает транслятор, когда хозяин её не принимает: Android 6.0 и новее на телефоне без 32-битного режима процессора (Р-154).
+
+Симптом (12.10, телефон без 32-битного режима; контейнеры 6.0, 6.0.1 и 7.1.x). «Пуск» → «Беда стенда: служба servicemanager вышла (код 1)». В журнале каждой
+службы (servicemanager, zygote, surfaceflinger) — по одной строке:
+
+  error setting PER_LINUX32 personality: Invalid argument
+
+Её печатает сама прошивка: библиотека C Android 6.0+ при старте КАЖДОЙ программы зовёт personality(PER_LINUX32) и при отказе завершается с кодом 1. На
+телефоне с 32-битным режимом процессора (там, где контейнеры всегда и работали) ядро соглашается; 4.x и 5.x вызова не делают.
+
+Причина. `case TARGET_NR_personality: return get_errno(personality(arg1));` — вызов гостя уходил ХОЗЯИНУ как есть. Ядро arm64 без поддержки AArch32
+на личность с базой PER_LINUX32 отвечает EINVAL (arch/arm64/kernel/sys.c: база PER_LINUX32 и нет system_supports_32bit_el0() → -EINVAL). Но личность
+хозяина гостю ничего не даёт: гостевой код исполняет сам транслятор, 32-битный режим хозяина ему не нужен (патч 0098 личность READ_IMPLIES_EXEC
+берёт из заголовков программы, а не из этого вызова, — не пересекается).
+
+Починка — личность гостя изображает транслятор (новый файл linux-user/guest_persona.c, решение — guest_persona.h, без qemu). Сперва всё как прежде: вызов
+уходит хозяину, принял — ответ хозяина гостю как есть (телефон с 32-битным режимом: те же вызовы, те же ответы, ни байта состояния). Отказ EINVAL на базе
+PER_LINUX32 (так же PER_LINUX32_3GB) — хозяину то же без базы (`arg & ~PER_MASK`: ADDR_NO_RANDOMIZE, READ_IMPLIES_EXEC и прочие флаги остаются хозяину);
+принял — гостю успех, значение гостя запоминается (слово на процесс, атомарно, без замка), в ответ — ПРЕЖНЕЕ значение гостя (первое — прежняя личность
+хозяина, её даёт ответ повторной установки). Запрос personality(0xffffffff) после этого отвечает значением гостя. Любой иной отказ (не EINVAL, база не
+PER_LINUX32, отказ повтора) — ошибка гостю, как прежде. Одна строка в журнал слежки (GUEST_PAGE_LOG) на процесс: «личность PER_LINUX32 изображена: у хозяина
+нет 32-битного режима».
+
+Патч меняет три места: вызов в syscall.c; объявление guest_persona() в user-internals.h (как у target_set_read_implies_exec из 0098, чьи строки здесь
+контекст — патч кладётся после 0098); новый файл в списке meson.build — по алфавиту, между guest_pagelog.c и guest_proc.c (как сказано в 0006).
+Проверки — native/test/test_persona.c, test_persona_glue.c и check_persona_wiring.py (Мак), tests/qemu/persona.sh (виртуалка).
+
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -20,6 +20,7 @@
+   'guest_net.c',
+   'guest_oom.c',
+   'guest_pagelog.c',
++  'guest_persona.c',
+   'guest_proc.c',
+   'guest_script.c',
+   'guest_selinux.c',
+--- a/linux-user/user-internals.h
++++ b/linux-user/user-internals.h
+@@ -61,6 +61,8 @@
+ void target_set_brk(abi_ulong new_brk);
+ /* ★ Р-141: личность READ_IMPLIES_EXEC (живёт в mmap.c; ставит загрузчик ELF по главной программе). */
+ void target_set_read_implies_exec(bool on, const char *image_name);
++/* ★ Р-154: personality() гостя — PER_LINUX32 изображает транслятор, если хозяин её не принимает (guest_persona.c). */
++int guest_persona(unsigned long arg);
+ void syscall_init(void);
+ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
+                     abi_long arg2, abi_long arg3, abi_long arg4,
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -13152,7 +13152,11 @@
+         }
+         return ret;
+     case TARGET_NR_personality:
+-        return get_errno(personality(arg1));
++        /*
++         * ★ Р-154: личность гостя изображает транслятор (guest_persona.c). Хозяин без 32-битного режима отвечает EINVAL на
++         * PER_LINUX32, а Android 6.0+ при старте каждой программы без этой личности завершается кодом 1.
++         */
++        return get_errno(guest_persona(arg1));
+ #ifdef TARGET_NR__llseek /* Not on alpha */
+     case TARGET_NR__llseek:
+         {

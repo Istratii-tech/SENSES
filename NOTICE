@@ -21,8 +21,8 @@ changes.
 | obtained from | `https://download.qemu.org/qemu-8.2.4.tar.xz` (132694904 bytes) |
 | sha256 of that archive | `ecf5537feab92641b99d7482f551f2195d3a5bd34acef9d52bfbff353a607397` (the build script refuses any other file) |
 | licence | GNU General Public License, version 2 (see `COPYING`); QEMU's own statement on the licences of its files is in `licenses/QEMU-LICENSE.txt` |
-| our patches | **97** (`qemu/patches/*.patch`) |
-| files we added | **39** (`qemu/src/`, 15470 lines) |
+| our patches | **99** (`qemu/patches/*.patch`) |
+| files we added | **43** (`qemu/src/`, 15940 lines) |
 
 ### 1.1. How to get the source code
 
@@ -85,7 +85,7 @@ into each of them at build time — see the step “ставлю пометки 
 
 **Files we added to `linux-user/`.** Each carries the header
 `SPDX-License-Identifier: GPL-2.0-or-later`. Dates of change:
-2026-08-29 … 2026-10-11.
+2026-08-29 … 2026-10-12.
 
 | file | lines |
 |---|---|
@@ -116,9 +116,13 @@ into each of them at build time — see the step “ставлю пометки 
 | `guest_oom.h` | 28 |
 | `guest_pagelog.c` | 786 |
 | `guest_pagelog.h` | 62 |
+| `guest_persona.c` | 47 |
+| `guest_persona.h` | 135 |
 | `guest_proc.c` | 385 |
 | `guest_proc.h` | 45 |
 | `guest_procpath.h` | 115 |
+| `guest_rlimit.c` | 123 |
+| `guest_rlimit.h` | 165 |
 | `guest_script.c` | 176 |
 | `guest_script.h` | 43 |
 | `guest_selinux.c` | 2192 |
@@ -145,7 +149,13 @@ stand: the names of its UNIX sockets as guest paths and the stand's own descript
 through `task/<thread>/` and `thread-self` (patch 0095, `guest_procpath.h`), a journal of
 the signals one guest process sends to another — who, to whom, which signal (`guest_kill.c`), the
 alarm device `/dev/alarm` of Android kept on the phone's timers (patch 0096, `guest_alarm.c`,
-`guest_alarm_core.h`), the two screen-wait nodes `/sys/power/wait_for_fb_sleep` and `…_wake` answered as the
+`guest_alarm_core.h`), the personality of the guest answered by the translator itself when the host kernel has no 32-bit
+mode (the C library of Android 6.0 and newer sets `PER_LINUX32` at the start of every program and exits if that fails; the
+call goes to the host first, a refusal of the `PER_LINUX32` base is repeated without the base, the guest's value is kept and
+returned — patch 0100, `guest_persona.c`, `guest_persona.h`, `linux-user/syscall.c`), the guest's raising of a resource limit above the host's hard limit
+(a guest system that sets a 64 MB locked-memory limit at start aborts if the host refuses it, and an app on the host may not raise its own hard limit: the call goes to the host
+first, a refusal for raising the hard limit is repeated with the host's own hard limit and the guest is told it succeeded, every other refusal is passed on as it was;
+`setrlimit` and `prlimit64` for the process itself — patch 0101, `guest_rlimit.c`, `guest_rlimit.h`, `linux-user/syscall.c`), the two screen-wait nodes `/sys/power/wait_for_fb_sleep` and `…_wake` answered as the
 kernel does with the screen on (the first sleeps for ever, the second says "awake"), when the
 tree has no such node (patch 0006 passes the open flags, `guest_fs.c`), the `READ_IMPLIES_EXEC` personality
 the ARM kernel gives a program without a `PT_GNU_STACK` header, so that readable memory (heap, anonymous and

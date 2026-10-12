@@ -1,5 +1,5 @@
 BUILD-MANIFEST for qemu-arm-android (libqemu.so)
-built (UTC):  2026-10-12 08:08:44
+built (UTC):  2026-10-12 17:43:16
 
 QEMU version:   8.2.4
 QEMU archive:   qemu-8.2.4.tar.xz  sha256 ecf5537feab92641b99d7482f551f2195d3a5bd34acef9d52bfbff353a607397
@@ -162,7 +162,7 @@ zlib-dev-1.3.2-r0
 zlib-static-1.3.2-r0
 zstd-libs-1.5.6-r0
 
-== patches: 97 (applied in this order), sha256
+== patches: 99 (applied in this order), sha256
 ff1eef4860322f87ce550a291e5a60c8baf08445f4ea67aeeab43b815d7a6b64  0001-skip-zero-sized-pt-load.patch
 92d6042923e425d56340c3ae28950290ea3304f26e53180d3cf3820f758be153  0002-musl-flock64.patch
 00e11b406ab21acc73e08bb8b48e5059d78d30226db09a12e5021b3799a09af8  0003-probe-mmap-min-addr.patch
@@ -260,8 +260,10 @@ a67f4fdde8bb84f738299bdc35ab8e86c10114d96d56f67607a1e9e7e1964a2d  0096-guest-ala
 1429cbc55c1e8c02f57759a5520ffcdc8a38cc2af92b101d711f0914c273fd0f  0097-ashmem-readonly-mmap.patch
 6f1c8589f47a886e3c89ad6675154448a0805b241220eaa569b8b5046dfc491a  0098-read-implies-exec-no-gnu-stack.patch
 c8a19cdac912fbc73b1a80643407ea7590568a691203f681dd024418337349fa  0099-self-queued-fault-signal-to-guest.patch
+db45f0127f6f16de0739fc6f5ea44aa12fac36cfcb23961091e759aaf8590630  0100-guest-personality-emulated.patch
+76b59e4a7060bacb52e1408ddccd0ef97f4e2bd6f79caf33c04ad56d3affd044  0101-guest-rlimit-raise-forgive.patch
 
-== our source files copied into linux-user/: 39, sha256
+== our source files copied into linux-user/: 43, sha256
 12facb98ec8ce0ffbadc2fca1995a86d4dadbdca94cfb294f37dec959596bcca  binder_proto.h
 1521c83fe9484ae011afe3a8aae51849783485291a1cc31f8c4cf793af5f8056  guest_alarm.c
 4383d2d77fdb2625fc23c32739dd271a29a276fef0b9287dfbd124178f45cbff  guest_alarm.h
@@ -289,9 +291,13 @@ ffa51e47c9c19e86aae07e5fd99f104ef00719ee1be07b897b6294e97295832a  guest_kill.c
 240e9f6ba80060ff4b301e2bd65c92d95ff15290fd77f39a3591d3d58b0258b1  guest_oom.h
 6942da39d31da4603d5e0734c4adb74e3dd5645df7e4bce09e91a0acbb948417  guest_pagelog.c
 28ef170aed0252300995258238681812c128bfe1dfb80c795dd8cfe3383ef81e  guest_pagelog.h
+cf4fae3aa2bb0eeba8a6d35b924c74e12a2e2cee8bd0ab53ea82762fe48a54d5  guest_persona.c
+2bd2a5f9361f1a3719550910ddf5258e5edf10666e0f1879e2d683c100ffcde0  guest_persona.h
 ef823ec923d73f8af1eb8e6faeb1217d85d4de2859e9c0110c5a9743d521b13a  guest_proc.c
 7e8b7631a0b7b2eae6478bfc39ab9f79a322dbd83d2f2332ab596a866dfb4a9f  guest_proc.h
 9cf9fb280bffdaf348c45a565ed83fa96d3b059c868f23335fc2bfa783043df2  guest_procpath.h
+b4424a84ce7c20459498b34cb1cf310a8595d6f2cea943e9c1baba7368a36d7b  guest_rlimit.c
+8b5a13b85219fe73c32af4b88149cd10fb2c760919255b8bdab451ba09d8eab8  guest_rlimit.h
 6144b84edc5ba1825e21fa81102203bdd0535a7353cc45da8c6d693f11878ad3  guest_script.c
 51b61d7c1644971e5c9dea4fcfe215c6024cc05120f97c5fb4cda4c5e0d7780b  guest_script.h
 2be98a215e32a7d9f472407c5ecc3feb0e08b54bc8e87fbd35f35c5d50c66a14  guest_selinux.c
@@ -303,8 +309,8 @@ aaba00c6d25926ee6ab6c1505422f2048e93df098e0403b3d5b3076607a860a1  guest_selinux.
 13b914fa330a96c3afaf1842277577f22a6fe1084c9ea0ade2f59cf53aecd092  guest_xattr.h
 
 == result, sha256
-f031b1d5d45b5234e1dfb47b5f1e65e1afebb71e36cb1f0b3b5d5ced11f807c8  qemu-arm
-29842f702563387031f4207eb6f2c7100542756f615d024224ddab90ea9e0aa5  qemu-arm-dbg
+5bc32e4650533e95db23d90f218de5f770d9b3e37e47f8e7d87ecce51151297e  qemu-arm
+05f072ecbd49083017cb10f8080228a339e842ee73cfe4786bbcdfa8bf51c02b  qemu-arm-dbg
 
 == build script, sha256
-531dd72c62693100caf2e83287b2a04d14bf3de79267ef39e80b6567a065c293  build-android.sh
+390ff70ba9a0b29679bf8088d43a2ae9d43aeb26c3e35a00565112a14dba7fbd  build-android.sh

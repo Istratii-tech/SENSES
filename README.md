@@ -87,8 +87,8 @@ COPYING                 GNU GPL version 2, full text
 NOTICE                  what is third-party, under which licence, where its source is
 licenses/               licence texts of the other third-party components
 qemu/build-android.sh   downloads upstream QEMU, applies patches, builds
-qemu/patches/           97 patches against QEMU 8.2.4
-qemu/src/               39 files we added to linux-user/, GPL-2.0-or-later
+qemu/patches/           99 patches against QEMU 8.2.4
+qemu/src/               43 files we added to linux-user/, GPL-2.0-or-later
 ```
 
 Each patch starts with a description of the symptom it exists for — that is

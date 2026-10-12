@@ -1,0 +1,84 @@
+Подъём предела ресурса выше жёсткого предела хозяина прощается: system_server прошивки 2.3.5 с `--rlimit` memlock на телефоне без 32-битного режима на Android 16 (Р-156).
+
+Симптом (12.10, телефон без 32-битного режима процессора, Android 16; прошивка 2.3.5 с `--rlimit`). «Пуск» → «SYSTEM_DIES, 16 с — умер system_server (код 137) —
+SIGSEGV libdvm.so +0x46b24». Адрес — dvmAbort() (запись в 0xdeadd00d): Dalvik остановил себя сам. В журнале гостя (main) прямо перед этим:
+
+  E dalvikvm cannot setrlimit(): Operation not permitted
+  E dalvikvm VM aborting
+  I Zygote Exit zygote because system server (…) has terminated
+
+Причина. framework.odex этой прошивки запускает system_server с доводом `--rlimit=8,67108864,67108864` — RLIMIT_MEMLOCK, мягкий = жёсткий = 64 МБ. Dalvik при
+forkSystemServer зовёт setrlimit(8, {64 МБ, 64 МБ}) (цикл setrlimitsFromArray), отказ → «cannot setrlimit()» → dvmAbort(). Транслятор отдавал этот вызов хозяину как
+есть (`get_errno(setrlimit(resource, &rlim))`), а у процесса приложения на этом телефоне предел заблокированной памяти — 65536/65536 (жёсткий тоже): поднять жёсткий предел
+выше текущего без CAP_SYS_RESOURCE ядро не даёт — EPERM (kernel/sys.c: do_prlimit). На телефоне с Android 9 жёсткий предел приложения выше, тот же контейнер 2.3.5 шёл до
+экрана; прошивка 2.3.3 без `--rlimit` грузится и на этом телефоне. Тот же класс, что у патчей 0029 (отказ mlock из-за 64 КБ) и 0023 (отказ setpriority): предел, которого у
+хозяина нет, гостю не нужен — гость лишь ПОДГОТОВИЛ с его помощью то, отказ чего мы и так прощаем (mlock).
+
+Починка — новый файл linux-user/guest_rlimit.c, решение — guest_rlimit.h (без qemu, таблица вызовов хозяина с указателями на функции). Сперва всё как прежде: вызов уходит
+хозяину; принял — ответ хозяина гостю как есть (телефон, где жёсткий предел выше, — те же вызовы, побайтно прежние). Отказ EPERM и жёсткий предел гостя больше текущего
+жёсткого предела хозяина по этому ресурсу (его читаем уже после отказа) — повтор хозяину с rlim_max = жёсткий хозяина и rlim_cur = min(просимый мягкий, жёсткий хозяина);
+удался — гостю 0 (у prlimit64 с указателем на прежние значения — прежние значения из повтора, как дало бы ядро), не удался — исходная ошибка. Любой иной отказ (EINVAL —
+мягкий больше жёсткого; EPERM без подъёма жёсткого; EFAULT, ESRCH…) — гостю как прежде, без повтора. prlimit64 — только для себя (pid 0 или свой); чужой pid — как прежде.
+RLIMIT_AS, RLIMIT_DATA и RLIMIT_STACK не тронуты: их qemu сам отвечает «успех», ничего не ставя. Одна строка в stderr и (при GUEST_PAGE_LOG) в журнал слежки на процесс и
+ресурс: «предел <номер> поднять выше жёсткого хозяина нельзя (просили <мягкий>/<жёсткий>, оставлено <мягкий>/<жёсткий>) — прощаем».
+
+⚠️ Что гость прочтёт потом getrlimit — НАСТОЯЩИЕ значения хозяина (65536/65536), а не обещанные: изображать их значило бы вести второе состояние на процесс (потомки fork,
+сброс при exec), а гостю, получившему 0, хватает: Dalvik предела после setrlimit не читает, отказ mlock под ним прощает 0029.
+
+Патч меняет три места: вызовы в syscall.c (setrlimit и prlimit64; хозяйское prlimit64 — по-прежнему sys_prlimit64, его передают указателем, чтобы статическая обёртка
+не осталась без вызова); объявления guest_setrlimit() и guest_prlimit64() в user-internals.h (после строк 0100); новый файл в списке meson.build — по алфавиту, между
+guest_proc.c и guest_script.c (как сказано в 0006). Проверки — native/test/test_rlimit.c, test_rlimit_glue.c и check_rlimit_wiring.py (Мак), tests/qemu/rlimit.sh (виртуалка).
+
+--- a/linux-user/user-internals.h
++++ b/linux-user/user-internals.h
+@@ -63,6 +63,15 @@
+ void target_set_read_implies_exec(bool on, const char *image_name);
+ /* ★ Р-154: personality() гостя — PER_LINUX32 изображает транслятор, если хозяин её не принимает (guest_persona.c). */
+ int guest_persona(unsigned long arg);
++/*
++ * ★ Р-156: setrlimit()/prlimit64() гостя — подъём предела выше жёсткого предела хозяина прощается (guest_rlimit.c). Хозяйское prlimit64
++ * передаёт вызывающий: это sys_prlimit64 из syscall.c.
++ */
++struct host_rlimit64;
++typedef int (*GuestPrlimit64Fn)(pid_t pid, int resource, const struct host_rlimit64 *new_limit, struct host_rlimit64 *old_limit);
++int guest_setrlimit(int resource, uint64_t cur, uint64_t max);
++int guest_prlimit64(GuestPrlimit64Fn host_prlimit64, int pid, int resource, const struct host_rlimit64 *new_limit,
++                    struct host_rlimit64 *old_limit);
+ void syscall_init(void);
+ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
+                     abi_long arg2, abi_long arg3, abi_long arg4,
+--- a/linux-user/meson.build
++++ b/linux-user/meson.build
+@@ -22,6 +22,7 @@
+   'guest_pagelog.c',
+   'guest_persona.c',
+   'guest_proc.c',
++  'guest_rlimit.c',
+   'guest_script.c',
+   'guest_selinux.c',
+   'guest_trace.c',
+--- a/linux-user/syscall.c
++++ b/linux-user/syscall.c
+@@ -12128,7 +12128,11 @@
+             if (resource != RLIMIT_AS &&
+                 resource != RLIMIT_DATA &&
+                 resource != RLIMIT_STACK) {
+-                return get_errno(setrlimit(resource, &rlim));
++                /*
++                 * ★ Р-156: отказ «жёсткий предел выше жёсткого предела хозяина» прощается (guest_rlimit.c): Dalvik системы 2.3.5
++                 * ставит memlock 64 МБ, а у приложения на телефоне без 32-битного режима жёсткий — 64 КБ; отказ убивал system_server.
++                 */
++                return get_errno(guest_setrlimit(resource, rlim.rlim_cur, rlim.rlim_max));
+             } else {
+                 return 0;
+             }
+@@ -15436,7 +15440,8 @@
+             rnewp = &rnew;
+         }
+ 
+-        ret = get_errno(sys_prlimit64(arg1, resource, rnewp, arg4 ? &rold : 0));
++        /* ★ Р-156: то же прощение, что у setrlimit, — только для себя (pid 0 или свой), guest_rlimit.c. */
++        ret = get_errno(guest_prlimit64(sys_prlimit64, arg1, resource, rnewp, arg4 ? &rold : 0));
+         if (!is_error(ret) && arg4) {
+             if (!lock_user_struct(VERIFY_WRITE, target_rold, arg4, 1)) {
+                 return -TARGET_EFAULT;
